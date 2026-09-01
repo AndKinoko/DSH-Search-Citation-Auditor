@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+
+# 构建产物（tsc 输出 + tsdown client bundle）
+lib/
+*.tgz
+
+# npm 库不提交 lockfile（发布与 git 安装都不需要）
+package-lock.json
+
+# 环境与密钥
+.env
+.env.local
+
+# 日志与增量编译缓存
+*.log
+*.tsbuildinfo
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+
+# 开发辅助
+.playwright-mcp/
+coverage/

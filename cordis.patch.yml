@@ -1,0 +1,5 @@
+- insert:
+    - id: dsh-citation-auditor
+      name: dsh-citation-auditor
+      config:
+        statePath: ""
