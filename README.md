@@ -1,5 +1,6 @@
 # Citation Auditor
-<img width="1280" height="704" alt="大肥鱼" src="https://github.com/user-attachments/assets/9c3f1778-0d9c-47bb-a2bb-8fd0092fbd2a" />
+<img width="1280" height="704" alt="大肥鱼" src="https://github.com/user-attachments/assets/700a5a9e-b5ae-4156-8357-08daf81b34b4" />
+
 审查 AI 回复里的引用来源：把回复中的 URL 提取出来，按威胁度打分排序，输出报表；**拦截名单里的域名会被真正禁止访问**（web_search / web_fetch 等 web 工具直接拒绝）。名单完全归用户维护，处置权在你手上。
 
 [Cordis](https://github.com/deepseek-ai/deepseek-harness) 函数插件，可被 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 直接加载。业务内核（scanner / scorer / report）是纯函数，脱离 dsh 也能复用。
