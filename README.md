@@ -92,7 +92,7 @@ npm run test        # 构建 + node:test（50 项）
 npm run verify      # dsh-plugin-standard 合规自检（社区自研规范，非官方认证）
 ```
 
-安装进 dsh profile：发布 npm 包或 `dsh plugin --profile web add github:AndKinoko/DSH_WEB_Citation-Auditor`（`prepare` 脚本自动构建）。配置只有一个字段：
+安装进 dsh profile：发布 npm 包或 `dsh plugin --profile web add github:AndKinoko/DSH-Search-Citation-Auditor`（`prepare` 脚本自动构建）。配置只有一个字段：
 
 ```yml
 - insert:
