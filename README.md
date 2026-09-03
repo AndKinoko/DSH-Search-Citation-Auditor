@@ -91,7 +91,7 @@ npm run typecheck   # tsc --noEmit
 npm run test        # 构建 + node:test（50 项）
 ```
 
-或 `dsh plugin --profile web add url`（`prepare` 脚本自动构建）。配置只有一个字段：
+或 `dsh plugin --profile web add https://github.com/AndKinoko/DSH-Search-Citation-Auditor/releases/download/v0.2.1/dsh-citation-auditor-0.2.1.tgz`（`prepare` 脚本自动构建）。配置只有一个字段：
 
 ```yml
 - insert:
