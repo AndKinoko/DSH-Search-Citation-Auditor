@@ -5,6 +5,16 @@
 
 [Cordis](https://github.com/deepseek-ai/deepseek-harness) 函数插件，可被 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 直接加载。业务内核（scanner / scorer / report）是纯函数，脱离 dsh 也能复用。
 
+## 工作效果
+###打分机制（当前打分机制非常简单，打分机制的细化为todo事项，我暂时没有什么好的想法，欢迎提issue）
+|模式|打分函数|判断维度|核心规则|典型分值 |
+|whitelist|scoreWhitelist|纯名单二元判定|命中白名单 → trusted；否则一律 critical|0 / 100|
+|simple|scoreSimple|域名注册年龄|注册于 2023 年前 → trusted；2023 年及以后 → critical；查不到年龄 → critical（treatAsNew）|0 / 100|
+|normal|scoreNormal|多信号累加|TLD 拦截、连字符/数字、长度、注册年龄、年龄可验证性分别累加|0–100|
+<img width="1541" height="820" alt="QQ20260903-011153" src="https://github.com/user-attachments/assets/7d8082ae-d209-4af4-9538-3c118bb4f9ae" />
+###拦截成功的效果如图
+<img width="1556" height="730" alt="QQ20260903-011055" src="https://github.com/user-attachments/assets/b1ee50ba-b40d-4875-ad97-e29c531d8e89" />
+
 ## 工作方式
 
 扫描文本 → 提取 URL → PSL 解析注册域（eTLD+1）→ 0–100 打分 → 出报表。
