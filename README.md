@@ -15,6 +15,7 @@
 | normal | scoreNormal | 多信号累加 | TLD 拦截、连字符/数字、长度、注册年龄、年龄可验证性分别累加 | 0–100 |
 
 <img width="1541" height="820" alt="QQ20260903-011153" src="https://github.com/user-attachments/assets/7d8082ae-d209-4af4-9538-3c118bb4f9ae" />
+
 ### 拦截成功的效果如图
 <img width="1556" height="730" alt="QQ20260903-011055" src="https://github.com/user-attachments/assets/b1ee50ba-b40d-4875-ad97-e29c531d8e89" />
 
