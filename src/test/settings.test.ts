@@ -13,6 +13,7 @@ import { Auditor } from "../auditor/service.js";
 import { AgeQueryFile } from "../auditor/ageQueryFile.js";
 import { DEFAULT_SETTINGS, type Settings } from "../auditor/types.js";
 import { DirectoryStore } from "../storage.js";
+import { DEFAULT_ENFORCEMENT, DEFAULT_SCORING } from "../auditor/types.js";
 import {
   makeSectionSchema,
   sectionToSettings,
@@ -80,6 +81,14 @@ test("settings ↔ section 双向映射：开关各就各位，ageQuery.code 不
     blocklistEnabledSimple: true,
     whitelistEnabledNormal: false,
     ageQueryEnabled: true,
+    enforcementBlocklist: DEFAULT_ENFORCEMENT.blocklist,
+    scoringCutoffYear: DEFAULT_SCORING.cutoffYear,
+    scoringTldTrustBonus: DEFAULT_SCORING.tldTrustBonus,
+    scoringPatternBonus: DEFAULT_SCORING.patternBonus,
+    scoringPostCutoffBonus: DEFAULT_SCORING.postCutoffBonus,
+    scoringUrlIpBonus: DEFAULT_SCORING.urlIpBonus,
+    scoringUrlShortenerBonus: DEFAULT_SCORING.urlShortenerBonus,
+    scoringUrlTrackingBonus: DEFAULT_SCORING.urlTrackingBonus,
   });
   const back = sectionToSettings(section, custom);
   assert.equal(back.enabled, false);
@@ -88,6 +97,7 @@ test("settings ↔ section 双向映射：开关各就各位，ageQuery.code 不
   assert.deepEqual(back.whitelistEnabled, { normal: false });
   assert.deepEqual(back.ageQuery, { code: "/* 保留 */", enabled: true });
   assert.equal(back.onFailure, "treatAsNew");
+  assert.equal(back.enforcement?.blocklist, DEFAULT_ENFORCEMENT.blocklist);
 });
 
 test("buildStatusPayload：文件路径、名单数量、设置快照", () => {
@@ -252,14 +262,14 @@ test("buildAuditPayload：verdicts 结构化 + 名单隶属标记 + 按钮状态
     const blocked = byDomain.get("blocked.example");
     assert.ok(blocked);
     assert.equal(blocked.inBlocklist, true, "拦截名单命中 → 按钮应显示已拦截");
-    assert.equal(blocked.sourceKind, "拦截名单");
+    assert.equal(blocked.sourceKind, "blocklist");
     assert.equal(blocked.level, "critical");
 
     const random = byDomain.get("random-site.xyz");
     assert.ok(random);
     assert.equal(random.inWhitelist, false);
     assert.equal(random.inBlocklist, false);
-    assert.equal(random.sourceKind, "未能验证");
+    assert.equal(random.sourceKind, "unverifiable");
     assert.equal(random.creationDate, undefined, "ageQuery 未启用时没有创建日期");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -345,6 +355,77 @@ test("audit/list 路由：POST JSON 体走通，非法 body 拒绝", async () =>
     const { res: r5, body: b5 } = fakeRes();
     await listRoute.handler({ method: "GET" } as never, r5 as never);
     assert.equal(b5().ok, false, "GET 不允许");
+
+    // v0.3：audit 负载携带处置策略与逐域动作
+    const { res: r8, body: b8 } = fakeRes();
+    await auditRoute.handler(fakeReq({ text: "看 https://github.com/a" }) as never, r8 as never);
+    const auditV03 = b8() as { enforcement: string; verdicts: Array<{ action: string }> };
+    assert.equal(auditV03.enforcement, "deny", "默认策略直接拦截");
+    assert.equal(auditV03.verdicts[0]?.action, "allow", "未命中名单的域名动作为 allow");
+
+    // 非法域名格式（空字符串或缺少点号）应被拒绝
+    const { res: r6, body: b6 } = fakeRes();
+    await listRoute.handler(fakeReq({ op: "block", domain: "" }) as never, r6 as never);
+    assert.equal(b6().ok, false, "空域名被拒绝");
+
+    const { res: r7, body: b7 } = fakeRes();
+    await listRoute.handler(fakeReq({ op: "block", domain: "nodot" }) as never, r7 as never);
+    assert.equal(b7().ok, false, "缺少点号的域名被拒绝");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("v0.3 处置策略与阈值：section 双向映射 + settings 路由写入 + 非法值钳制", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "citation-auditor-test-"));
+  try {
+    const auditor = makeAuditor(dir);
+    // section 写入策略与阈值
+    const current = auditor.getSettings();
+    const section = {
+      ...settingsToSection(current),
+      enforcementBlocklist: "ask" as const,
+      scoringCutoffYear: 2020,
+      scoringUrlIpBonus: 99,
+    };
+    const next = sectionToSettings(section, current);
+    assert.equal(next.enforcement?.blocklist, "ask");
+    assert.equal(next.scoring?.cutoffYear, 2020);
+    assert.equal(next.scoring?.urlIpBonus, 99);
+    // 未暴露的 scoring 键保留
+    assert.equal(next.scoring?.urlUserinfoBonus, DEFAULT_SCORING.urlUserinfoBonus);
+    auditor.rules.saveSettings(next);
+    assert.equal(auditor.getSettings().enforcement?.blocklist, "ask");
+
+    // 非法策略值回退到当前值；越界数字被钳制
+    const bad = sectionToSettings(
+      { ...section, enforcementBlocklist: "explode" as never, scoringCutoffYear: 9999, scoringUrlIpBonus: -5 },
+      auditor.getSettings(),
+    );
+    assert.equal(bad.enforcement?.blocklist, "ask", "非法策略值不覆盖");
+    assert.equal(bad.scoring?.cutoffYear, 2100, "年份上溢钳制到 2100");
+    assert.equal(bad.scoring?.urlIpBonus, 0, "加分下溢钳制到 0");
+
+    // settings 路由接受 enforcementBlocklist 与评分数值
+    const routes = makeCitationRoutes(auditor, dir);
+    const settingsRoute = routes[5]!;
+    const fakeReq = (json: unknown): unknown => {
+      const stream = new PassThrough() as PassThrough & { method: string };
+      stream.method = "POST";
+      stream.write(JSON.stringify(json));
+      stream.end();
+      return stream;
+    };
+    const { res, body } = fakeRes();
+    await settingsRoute.handler(
+      fakeReq({ enforcementBlocklist: "allow", scoringCutoffYear: 2021 }) as never,
+      res as never,
+    );
+    const out = body() as { ok: boolean; settings: CitationSettingsSection };
+    assert.equal(out.ok, true);
+    assert.equal(out.settings.enforcementBlocklist, "allow");
+    assert.equal(out.settings.scoringCutoffYear, 2021);
+    assert.equal(auditor.getSettings().enforcement?.blocklist, "allow");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

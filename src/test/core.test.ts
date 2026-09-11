@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, readdirSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { scan, extractDomain } from "../auditor/scanner.js";
+import { scan, extractDomain, analyzeUrl, scanDetailed, aggregateDomainSignals } from "../auditor/scanner.js";
 import { classify, sortByThreat, levelFromScore } from "../auditor/scorer.js";
 import { renderReport, renderSummaryLine } from "../auditor/report.js";
 import { RuleStore } from "../auditor/rules.js";
@@ -34,6 +34,8 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     ...overrides,
     blocklistEnabled: { ...DEFAULT_SETTINGS.blocklistEnabled, ...(overrides.blocklistEnabled ?? {}) },
     ageQuery: { ...DEFAULT_SETTINGS.ageQuery, ...(overrides.ageQuery ?? {}) },
+    enforcement: overrides.enforcement,
+    scoring: overrides.scoring,
   };
 }
 
@@ -74,6 +76,115 @@ test("scanner：全角标点不残留在 URL 尾部", () => {
   assert.ok(urls.includes("https://example.com/a"), `实际: ${urls.join(" | ")}`);
   assert.ok(urls.includes("https://example.com/b"));
   assert.ok(!urls.some((u) => /[，。；：！？、】》]$/.test(u)));
+});
+
+// ---------- v0.3 URL 结构信号 ----------
+
+test("scanner：analyzeUrl 识别 IP/短链/追踪参数/深路径/长查询/非标准端口", () => {
+  const ip = analyzeUrl("http://192.168.1.1/admin");
+  assert.ok(ip?.isIp, "IPv4 直连应标记");
+
+  const short = analyzeUrl("https://bit.ly/abc123?utm_source=x");
+  assert.equal(short?.isShortener, true, "短链域名应标记");
+  assert.equal(short?.hasTracking, true, "utm_ 参数应标记");
+
+  const deep = analyzeUrl("https://example.com/a/b/c/d/e");
+  assert.equal(deep?.deepPath, true, "≥4 段路径应标记");
+  assert.equal(deep?.pathDepth, 5);
+
+  const shallow = analyzeUrl("https://example.com/a");
+  assert.equal(shallow?.deepPath, false);
+  assert.equal(shallow?.hasTracking, false);
+  assert.equal(shallow?.isShortener, false);
+
+  const longQuery = analyzeUrl(`https://example.com/s?${"q=1&".repeat(40)}`);
+  assert.equal(longQuery?.longQuery, true, "超长查询串应标记");
+
+  const port = analyzeUrl("https://example.com:8443/x");
+  assert.equal(port?.nonStandardPort, true, "非标准端口应标记");
+  const stdPort = analyzeUrl("https://example.com:443/x");
+  assert.equal(stdPort?.nonStandardPort, false, "标准端口不标记");
+
+  const atPath = analyzeUrl("https://example.com/@user");
+  assert.equal(atPath?.hasUserinfo, false, "路径里的 @ 不算 userinfo");
+
+  assert.equal(analyzeUrl("not a url"), null);
+});
+
+test("scanner：userinfo 混淆 URL 完整提取并归属真实主机", () => {
+  const { urls, domains, details } = scanDetailed("小心 https://trusted.com@evil.example/login 看清楚");
+  assert.ok(urls.some((u) => u.includes("trusted.com@evil.example")), `实际: ${urls.join(" | ")}`);
+  assert.ok(domains.includes("evil.example"), "应归属 @ 后的真实主机");
+  assert.ok(!domains.includes("trusted.com"), "不得误判为 @ 前的伪装主机");
+  const agg = aggregateDomainSignals(details, "evil.example");
+  assert.equal(agg.hasUserinfo, true);
+
+  const { domains: d2 } = scanDetailed("登录 https://user:pass@example.com/ 继续");
+  assert.ok(d2.includes("example.com"));
+});
+
+test("scanner：scanDetailed 聚合域级信号（同域多 URL 不叠加）", () => {
+  const { urls, domains, details } = scanDetailed(
+    "看 https://bit.ly/a 和 https://example.com/x?utm_source=n 再看 https://example.com/y",
+  );
+  assert.ok(urls.length >= 3);
+  assert.ok(domains.includes("bit.ly"));
+  assert.ok(domains.includes("example.com"));
+  const aggShort = aggregateDomainSignals(details, "bit.ly");
+  assert.equal(aggShort.hasShortener, true);
+  const aggEx = aggregateDomainSignals(details, "example.com");
+  assert.equal(aggEx.hasTracking, true, "同域任一 URL 命中即聚合");
+  assert.equal(aggEx.hasShortener, undefined);
+});
+
+test("scorer：URL 结构信号各自加分一次", () => {
+  const v = classify(
+    baseInput({
+      domain: "example.com",
+      creationDate: "2010-01-01T00:00:00Z",
+      urlSignals: { hasIp: true, hasShortener: true, hasTracking: true },
+    }),
+  );
+  // 2010 老域名无年龄加分、无 TLD 加分：25(IP)+15(短链)+5(追踪)=45 → warning
+  assert.equal(v.score, 45);
+  assert.equal(v.level, "warning");
+  assert.ok(v.reasons.some((r) => r.includes("IP 直连")));
+  assert.ok(v.reasons.some((r) => r.includes("短链")));
+  assert.ok(v.reasons.some((r) => r.includes("追踪")));
+
+  const clean = classify(baseInput({ domain: "example.com", creationDate: "2010-01-01T00:00:00Z" }));
+  assert.equal(clean.score, 0, "无 URL 信号的老域名保持 0 分");
+});
+
+test("scorer：URL 信号权重可配（settings.scoring 覆盖）", () => {
+  const v = classify(
+    baseInput({
+      domain: "example.com",
+      creationDate: "2010-01-01T00:00:00Z",
+      settings: settings({ scoring: { urlIpBonus: 5 } }),
+      urlSignals: { hasIp: true },
+    }),
+  );
+  assert.equal(v.score, 5);
+});
+
+test("Auditor：命中拦截名单的 verdict 自带 action（默认 deny）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "citation-auditor-test-"));
+  try {
+    const store = new DirectoryStore(dir);
+    const ageFile = new AgeQueryFile(dir);
+    ageFile.ensure();
+    const auditor = new Auditor(store, ageFile);
+    auditor.init();
+    auditor.rules.addToBlocklist("evil.example", "测试");
+    const out = await auditor.audit("看 https://evil.example/x 和 https://github.com/y");
+    const byDomain = new Map(out.result.verdicts.map((v) => [v.domain, v]));
+    assert.equal(byDomain.get("evil.example")?.action, "deny");
+    assert.equal(byDomain.get("github.com")?.action, "allow");
+    assert.ok(out.report.includes("直接拦截"), "报表页脚展示当前策略");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------- scorer ----------
@@ -156,6 +267,7 @@ test("scorer：TLD 拦截同样受每模式开关控制", () => {
   assert.ok(on.reasons.some((r) => r.includes("TLD")));
 
   // 普通模式开关关：TLD 名单条目不再参与，走其他信号（本例只有年龄，2010 老域名 → 0 分可信）
+  // 注意：spam.xyz 的 .xyz TLD 在高风险列表中，会额外加 tldTrustBonus（默认 10 分）
   const off = classify(
     baseInput({
       domain: "spam.xyz",
@@ -164,9 +276,10 @@ test("scorer：TLD 拦截同样受每模式开关控制", () => {
       settings: settings({ blocklistEnabled: { whitelist: true, normal: false, simple: true } }),
     }),
   );
-  assert.ok(!off.reasons.some((r) => r.includes("TLD")), "关闭开关后不再出现 TLD 拦截理由");
+  assert.ok(!off.reasons.some((r) => r.includes("TLD 在拦截名单")), "关闭开关后不再出现 TLD 拦截理由");
   assert.equal(off.judgedBy, "score_engine");
-  assert.equal(off.score, 0, "只保留剩余信号，TLD 40 分不再累加");
+  // .xyz 是高风险 TLD，会加 tldTrustBonus（默认 10 分），所以分数不是 0
+  assert.equal(off.score, 10, "TLD 拦截名单关闭后只保留 TLD 可信度评分");
 });
 
 test("scorer：排序与分级", () => {
@@ -397,9 +510,9 @@ test("Auditor：缓存命中标'缓存'，首次查询标'API查询'", async () 
     auditor.rules.saveSettings(s);
 
     const first = await auditor.audit("看 https://github.com/x");
-    assert.equal(first.result.verdicts[0]!.sourceKind, "API查询", "首次查询走网络");
+    assert.equal(first.result.verdicts[0]!.sourceKind, "api_query", "首次查询走网络");
     const second = await auditor.audit("看 https://github.com/x");
-    assert.equal(second.result.verdicts[0]!.sourceKind, "缓存", "第二次命中缓存");
+    assert.equal(second.result.verdicts[0]!.sourceKind, "cache", "第二次命中缓存");
     assert.equal(second.result.verdicts[0]!.creationDate, "2012-02-11T00:00:00.000Z");
   } finally {
     rmSync(dir, { recursive: true, force: true });

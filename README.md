@@ -1,18 +1,18 @@
 # Citation Auditor
 <img width="1280" height="704" alt="大肥鱼" src="https://github.com/user-attachments/assets/700a5a9e-b5ae-4156-8357-08daf81b34b4" />
 
-审查 AI 回复里的引用来源：把回复中的 URL 提取出来，按威胁度打分排序，输出报表；**拦截名单里的域名会被真正禁止访问**（web_search / web_fetch 等 web 工具直接拒绝）。名单完全归用户维护，处置权在你手上。
+审查 AI 回复里的引用来源：把回复中的 URL 提取出来，按威胁度打分排序，输出报表；**拦截名单里的域名会按拦截策略处置**（allow=仅提醒 / ask=需确认 / deny=直接拒绝 web_search / web_fetch 等 web 工具，默认直接拦截）。名单完全归用户维护，处置权在你手上。
 
 [Cordis](https://github.com/deepseek-ai/deepseek-harness) 函数插件，可被 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 直接加载。业务内核（scanner / scorer / report）是纯函数，脱离 dsh 也能复用。
 
 ## 工作效果
-### 打分机制（当前打分机制非常简单，打分机制的细化为todo事项，我暂时没有什么好的想法，欢迎提issue）
+### 打分机制（v0.3 起多信号可配，阈值见下方“高级阈值”，欢迎提 issue 讨论权重）
 
 | 模式 | 打分函数 | 判断维度 | 核心规则 | 典型分值 |
 | --- | --- | --- | --- | --- |
 | whitelist | scoreWhitelist | 纯名单二元判定 | 命中白名单 → trusted；否则一律 critical | 0 / 100 |
-| simple | scoreSimple | 域名注册年龄 | 注册于 2023 年前 → trusted；2023 年及以后 → critical；查不到年龄 → critical（treatAsNew） | 0 / 100 |
-| normal | scoreNormal | 多信号累加 | TLD 拦截、连字符/数字、长度、注册年龄、年龄可验证性分别累加 | 0–100 |
+| simple | scoreSimple | 域名注册年龄 | 注册于分界年（默认 2023，可配）前 → trusted；此年及以后 → critical；查不到年龄 → critical（treatAsNew） | 0 / 100 |
+| normal | scoreNormal | 多信号累加 | TLD 拦截+TLD 可信度分级、连字符/数字、域名长度、注册年龄、年龄可验证性、URL 结构信号（IP 直连、userinfo/@ 混淆、短链、追踪参数、深路径、超长查询、非标准端口）分别累加，同域多 URL 各信号只计一次 | 0–100 |
 
 <img width="1541" height="820" alt="QQ20260903-011153" src="https://github.com/user-attachments/assets/7d8082ae-d209-4af4-9538-3c118bb4f9ae" />
 
@@ -26,23 +26,24 @@
 三种模式：
 
 - **白名单模式**：名单内绿，名单外全红。最严。
-- **简单模式**：2023 年前注册的可信，之后标红。
-- **普通模式**：多信号综合评分（TLD、连字符/数字个数、域名长度、注册年龄）。
+- **简单模式**：分界年（默认 2023，可配）前注册的可信，之后标红。
+- **普通模式**：多信号综合评分（TLD、连字符/数字个数、域名长度、注册年龄、URL 结构信号）。
 
 命中拦截名单的域名直接标红，不参与评分；精确域名与 `.xyz`/`.shop` 这类 TLD 条目都受**当前模式**的拦截名单开关控制（开关关闭 = 该模式完全不应用名单）。域名匹配统一按注册域：`en.wikipedia.org` → `wikipedia.org`。年龄查不到时只记"可疑"（ageQuery 未启用或查询失败），只有确认是新域名才从严标红。
 
-**真实拦截**：拦截名单（含 `.shop` 这类 TLD 条目）会在 `tools/pre-execute` 阶段拦截 web 工具（web_search / web_fetch 等），命中即拒绝调用并告知模型原因——加入名单后模型就访问不了该网页了。只拦 web 工具；pwsh/curl 等 shell 通道属沙箱层，不在拦截范围。名单增删（界面按钮或直接改 blocklist.json）即时生效，无需重启。
+**真实拦截**：拦截名单（含 `.shop` 这类 TLD 条目）会在 `tools/pre-execute` 阶段按拦截策略处置 web 工具（web_search / web_fetch 等）：`deny`（默认）命中即拒绝调用并告知模型原因——加入名单后模型就访问不了该网页了；`ask` 命中时需确认后才访问；`allow` 仅在报表标红，不阻止访问。策略经设置页 / 悬浮窗 / `citation_manage policy` 切换，即时生效。只拦 web 工具；pwsh/curl 等 shell 通道属沙箱层，不在拦截范围。名单增删（界面按钮或直接改 blocklist.json）即时生效，无需重启。
 
 向 dsh 注册两个工具：
 
 | 工具 | 作用 |
 |---|---|
-| `citation_audit` | 审计一段文本，返回结构化结果 + 纯文本报表 |
-| `citation_manage` | 查状态、启停、切模式、增删名单、测试年龄片段 |
+| `citation_audit` | 审计一段文本，返回结构化结果（含逐域处置动作 `action`）+ 纯文本报表 |
+| `citation_manage` | 查状态、启停、切模式、增删名单、切拦截策略（`policy` + `action`）、测试年龄片段 |
 
 ## Web 界面
 
-- **设置页卡片**：三种模式单选、各模式拦截名单开关、白名单免查加速、插件总开关、年龄片段 [编辑JS代码] 与 [测试]（固定 wikipedia.org）。名单旁的 [查看/编辑] 用系统默认程序打开对应 JSON，改完即生效。
+- **设置页卡片**：三种模式单选、各模式拦截名单开关、白名单免查加速、插件总开关、拦截策略三档（仅提醒/需确认/直接拦截）、高级阈值（年份分界线与各项加分，可展开）、年龄片段 [编辑JS代码] 与 [测试]（固定 wikipedia.org）。名单旁的 [查看/编辑] 用系统默认程序打开对应 JSON，改完即生效。
+- **悬浮窗设置**：面板内 ⚙ 同样可切拦截策略与高级阈值，与设置页同一 `/settings` 通道落盘。
 - **交互报表**：会话里 `citation_audit` 渲染成可点报表，非可信域名带 [➕ 加入拦截名单] / [➕ 加入白名单] / [忽略]；拦截名单开关关闭时弹窗三选（开启并保存 / 仅保存 / 取消）。写入后按钮变灰，可再点确认移除。
 - **悬浮窗**：右下角可拖动球（有可疑域名时显示红色角标），点击展开最近回复的网址列表与分数；面板内含 ⚙ 设置入口和同样的名单按钮。悬浮窗按宿主实际能力取会话节点：新宿主优先订阅 `uiConversation` 的 chat 通道（`legacy.nodes`），旧宿主回退会话快照自带的 nodes。
 
@@ -88,10 +89,10 @@ async (domain, fetch) => {
 ```bash
 npm install
 npm run typecheck   # tsc --noEmit
-npm run test        # 构建 + node:test（50 项）
+npm run test        # 构建 + node:test（61 项）
 ```
 
-或 `dsh plugin --profile web add https://github.com/AndKinoko/DSH-Search-Citation-Auditor/releases/download/v0.2.1/dsh-citation-auditor-0.2.1.tgz`（`prepare` 脚本自动构建）。配置只有一个字段：
+或 `dsh plugin --profile web add https://github.com/AndKinoko/DSH-Search-Citation-Auditor/releases/download/v0.3.0/dsh-citation-auditor-0.3.0.tgz`（`prepare` 脚本自动构建）。配置只有一个字段：
 
 ```yml
 - insert:
@@ -110,11 +111,20 @@ src/
 ├── index.ts           # Cordis 插件入口（name/inject/Config/apply + 两个工具）
 ├── storage.ts         # 目录化键值存储（每 key 一文件 + mtime 热重载 + 原子写）
 ├── routes.ts          # /api/citation-auditor/* 数据端点
-├── settingsSection.ts # 设置命名空间 host 半边
+├── settingsSection.ts # 设置命名空间 host 半边（含策略与阈值映射）
+├── webBlock.ts        # pre-execute 处置（deny/ask/allow 三档）
 ├── client/            # 浏览器半边（设置卡片 / 交互报表 / 悬浮窗）
+│   ├── constants.ts   # 共享常量（颜色/模式标签/字体）
+│   └── float/         # 悬浮窗子组件（FloatBall/AuditPanel/SettingsPanel/ConfirmDialog）
 ├── test/              # node:test 一致性测试
 └── auditor/           # 业务内核（scanner/scorer/report 纯函数 + rules/cache/ageQuery）
 ```
+
+## v0.3 更新
+
+- **URL 结构信号**：IP 直连、userinfo/`@` 混淆、短链、追踪参数、深路径、超长查询、非标准端口分别加分，同域多 URL 只计一次。含 `@` 的 URL 会完整提取并归属 `@` 后的真实主机（此前会被截断）。
+- **拦截策略三档**：`allow` 仅提醒 / `ask` 需确认 / `deny` 直接拦截（默认），命中名单的 verdict 自带 `action`。
+- **高级阈值 UI**：设置页与悬浮窗均可调年份分界线与各项加分，其余 scoring 键直接改 `settings.json` 即生效。
 
 ## License
 

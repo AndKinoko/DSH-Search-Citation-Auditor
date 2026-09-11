@@ -98,8 +98,14 @@ export function apply(ctx: Context, config: AuditorConfig): void {
                 sourceKind: {
                   type: "string",
                   required: true,
-                  enum: ["API查询", "缓存", "白名单", "拦截名单", "未能验证"],
+                  enum: ["api_query", "cache", "whitelist", "blocklist", "unverifiable"],
                   description: "来源类型",
+                },
+                action: {
+                  type: "string",
+                  required: true,
+                  enum: ["allow", "ask", "deny"],
+                  description: "命中拦截名单时的处置动作（allow=仅提醒，ask=需确认，deny=直接拦截）",
                 },
                 creationDate: { type: "string", description: "域名创建日期（ISO）；未能验证时缺省" },
               },
@@ -122,7 +128,8 @@ export function apply(ctx: Context, config: AuditorConfig): void {
           score: v.score,
           level: v.level,
           reasons: v.reasons,
-          sourceKind: v.sourceKind ?? ("未能验证" as const),
+          sourceKind: v.sourceKind ?? "unverifiable",
+          action: v.action ?? "allow",
           ...(v.creationDate !== undefined ? { creationDate: v.creationDate } : {}),
         })),
       };
@@ -133,19 +140,20 @@ export function apply(ctx: Context, config: AuditorConfig): void {
     name: "citation_manage",
     description:
       "管理引用审计器：查看状态、启用/休眠插件、切换模式（whitelist/normal/simple）、增删白名单与拦截名单、" +
-      "测试年龄查询片段。所有名单数据落盘且归用户所有。",
+      "切换拦截策略（allow=仅提醒/ask=需确认/deny=直接拦截）、测试年龄查询片段。所有名单数据落盘且归用户所有。",
     parameters: {
       op: {
         type: "string",
         required: true,
-        enum: ["status", "enabled", "mode", "block", "whitelist", "remove", "testAgeQuery"],
+        enum: ["status", "enabled", "mode", "block", "whitelist", "remove", "policy", "testAgeQuery"],
         description:
-          "status=查看状态；enabled=启用/休眠插件；mode=切换模式；block=加入拦截名单；whitelist=加入白名单；remove=从名单移除；testAgeQuery=用 wikipedia.org 测试年龄片段",
+          "status=查看状态；enabled=启用/休眠插件；mode=切换模式；block=加入拦截名单；whitelist=加入白名单；remove=从名单移除；policy=切换拦截策略；testAgeQuery=用 wikipedia.org 测试年龄片段",
       },
       value: { type: "boolean", description: "op=enabled 时的目标状态（true=启用，false=休眠）" },
       mode: { type: "string", enum: ["whitelist", "normal", "simple"], description: "op=mode 时的目标模式" },
       domain: { type: "string", description: "op=block/whitelist/remove 时的域名（TLD 用 .xyz 形式）" },
       reason: { type: "string", description: "标记理由，可省略" },
+      action: { type: "string", enum: ["allow", "ask", "deny"], description: "op=policy 时的目标策略（allow=仅提醒，ask=需确认，deny=直接拦截）" },
     },
     output: {
       schema: {
@@ -162,10 +170,12 @@ export function apply(ctx: Context, config: AuditorConfig): void {
       switch (args.op) {
         case "status": {
           const s = auditor.status;
+          const policyLabel = s.enforcement === "deny" ? "直接拦截" : s.enforcement === "ask" ? "需确认" : "仅提醒";
           return {
             result:
               `插件: ${s.enabled ? "启用" : "休眠（所有检测关闭）"}\n模式: ${s.mode}\n` +
               `拦截名单开关(当前模式): ${s.blocklistEnabled ? "开" : "关"}\n` +
+              `拦截策略: ${policyLabel}(${s.enforcement})\n` +
               `白名单: ${s.whitelistCount} 条\n拦截名单: ${s.blocklistCount} 条\n` +
               `年龄查询: ${s.ageQueryEnabled ? "启用" : "停用"}`,
           };
@@ -188,6 +198,7 @@ export function apply(ctx: Context, config: AuditorConfig): void {
             args.op === "block"
               ? auditor.rules.addToBlocklist(domain, args.reason ?? "")
               : auditor.rules.addToWhitelist(domain, args.reason ?? "");
+          if (list === null) return { result: "域名格式非法（空字符串或缺少点号）" };
           return { result: `${args.op === "block" ? "拦截名单" : "白名单"}现有 ${list.length} 条，含 ${domain}` };
         }
         case "remove": {
@@ -196,6 +207,14 @@ export function apply(ctx: Context, config: AuditorConfig): void {
           const okWhite = auditor.rules.removeFromList("whitelist", domain);
           const okBlock = auditor.rules.removeFromList("blocklist", domain);
           return { result: okWhite || okBlock ? `已移除 ${domain}` : `名单中没有 ${domain}` };
+        }
+        case "policy": {
+          if (args.action !== "allow" && args.action !== "ask" && args.action !== "deny") {
+            return { result: `缺少或非法的 action 参数: ${String(args.action)}（allow/ask/deny）` };
+          }
+          const s = auditor.getSettings();
+          auditor.rules.saveSettings({ ...s, enforcement: { ...s.enforcement, blocklist: args.action } });
+          return { result: `拦截策略已切换: ${args.action}` };
         }
         case "testAgeQuery": {
           const code = auditor.getAgeQueryCode(); // 实时读 ageQuery.js
@@ -215,11 +234,11 @@ export function apply(ctx: Context, config: AuditorConfig): void {
   ctx.effect(() => ctx.tools.register(manageTool), "tools.register citation_manage");
 
   // 真实拦截：tools/pre-execute 阶段检查 web 工具（web_search / web_fetch 等）
-  // 参数里的域名，命中拦截名单即 deny——模型无法再访问被拦网页。
+  // 参数里的域名，命中拦截名单即按策略处置（deny=直接拦截，ask=需确认，allow=仅提醒放行）。
   ctx.on("tools/pre-execute", async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
     if (!auditor.getSettings().enabled) return next(); // 插件休眠时不拦
-    const denied = blockedToolDecision(auditor, exec.name, exec.arguments);
-    return denied ?? next();
+    const decision = blockedToolDecision(auditor, exec.name, exec.arguments);
+    return decision ?? next();
   });
 
   // 设置命名空间的 host 兼容注册：settings 服务存在时注册，写入经 onChange 回写

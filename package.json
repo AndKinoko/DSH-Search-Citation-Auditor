@@ -1,7 +1,7 @@
 {
   "name": "dsh-citation-auditor",
-  "version": "0.2.1",
-  "description": "Citation Auditor — 审查 AI 回复里的引用来源：扫描、评分、出报表，只读不拦截",
+  "version": "0.3.0",
+  "description": "Citation Auditor — 审查 AI 回复里的引用来源：扫描、评分、出报表，拦截策略可配",
   "license": "MIT",
   "private": false,
   "type": "module",

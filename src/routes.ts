@@ -18,6 +18,7 @@ import { join } from "node:path";
 import type { WebRoute } from "@deepseek-ai/dsh-host-webserver";
 import type { Auditor } from "./auditor/service.js";
 import { testAgeQuery } from "./auditor/ageQuery.js";
+import { DEFAULT_ENFORCEMENT } from "./auditor/types.js";
 import { settingsToSection, sectionToSettings, type CitationSettingsSection } from "./settingsSection.js";
 
 /** 浏览器侧 API 基路径。 */
@@ -115,18 +116,21 @@ export function buildAuditPayload(auditor: Auditor, text: string): Promise<Recor
     const s = auditor.getSettings();
     const whitelist = auditor.rules.whitelistSet();
     const { domains: blockDomains } = auditor.rules.blocklistSets();
+    const enforcement = s.enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist;
     return {
       ok: true,
       enabled: s.enabled,
       mode: s.mode,
       blocklistEnabled: s.blocklistEnabled[s.mode],
+      enforcement,
       summary: outcome.summary ?? "",
       verdicts: outcome.result.verdicts.map((v) => ({
         domain: v.domain,
         score: v.score,
         level: v.level,
         reasons: v.reasons,
-        sourceKind: v.sourceKind ?? "未能验证",
+        sourceKind: v.sourceKind ?? "unverifiable",
+        action: v.action ?? "allow",
         ...(v.creationDate !== undefined ? { creationDate: v.creationDate } : {}),
         inWhitelist: whitelist.has(v.domain),
         inBlocklist: blockDomains.has(v.domain),
@@ -144,24 +148,30 @@ export function applyListOp(
 ): Record<string, unknown> {
   const target = domain.trim().toLowerCase();
   if (target === "") return { ok: false, error: "domain 不能为空" };
+  let removed = false;
   switch (op) {
-    case "block":
-      auditor.rules.addToBlocklist(target, reason);
+    case "block": {
+      const result = auditor.rules.addToBlocklist(target, reason);
+      if (result === null) return { ok: false, error: "域名格式非法（空字符串或缺少点号）" };
       break;
-    case "whitelist":
-      auditor.rules.addToWhitelist(target, reason);
+    }
+    case "whitelist": {
+      const result = auditor.rules.addToWhitelist(target, reason);
+      if (result === null) return { ok: false, error: "域名格式非法（空字符串或缺少点号）" };
       break;
+    }
     case "unblock":
-      auditor.rules.removeFromList("blocklist", target);
+      removed = auditor.rules.removeFromList("blocklist", target);
       break;
     case "unwhitelist":
-      auditor.rules.removeFromList("whitelist", target);
+      removed = auditor.rules.removeFromList("whitelist", target);
       break;
   }
   return {
     ok: true,
     op,
     domain: target,
+    removed: op === "unblock" || op === "unwhitelist" ? removed : undefined,
     inWhitelist: auditor.rules.whitelistSet().has(target),
     inBlocklist: auditor.rules.blocklistSets().domains.has(target),
     counts: {
@@ -321,12 +331,23 @@ export function makeCitationRoutes(
             "enabled", "blocklistEnabledWhitelist", "blocklistEnabledNormal",
             "blocklistEnabledSimple", "whitelistEnabledNormal", "ageQueryEnabled",
           ];
+          const NUM_FIELDS: ReadonlyArray<keyof CitationSettingsSection> = [
+            "scoringCutoffYear", "scoringTldTrustBonus", "scoringPatternBonus",
+            "scoringPostCutoffBonus", "scoringUrlIpBonus", "scoringUrlShortenerBonus",
+            "scoringUrlTrackingBonus",
+          ];
           const clean: Record<string, unknown> = {};
           for (const field of BOOL_FIELDS) {
             if (typeof patch[field] === "boolean") clean[field] = patch[field];
           }
+          for (const field of NUM_FIELDS) {
+            if (typeof patch[field] === "number" && Number.isFinite(patch[field])) clean[field] = patch[field];
+          }
           if (patch["mode"] === "whitelist" || patch["mode"] === "normal" || patch["mode"] === "simple") {
             clean.mode = patch["mode"];
+          }
+          if (patch["enforcementBlocklist"] === "allow" || patch["enforcementBlocklist"] === "ask" || patch["enforcementBlocklist"] === "deny") {
+            clean.enforcementBlocklist = patch["enforcementBlocklist"];
           }
           if (Object.keys(clean).length === 0) {
             writeJson(res, 400, { ok: false, error: "没有可识别的设置字段" });

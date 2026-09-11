@@ -33,112 +33,26 @@ import {
   type ChatLegacyLike,
   type FloatLikeSnapshot,
 } from "./floatData.js";
-import { LEVEL_LABEL, type Level } from "../auditor/types.js";
 import type { CitationSettingsSection } from "../settingsSection.js";
-
-/** /api/citation-auditor/audit 负载里的单条判决（含按钮状态机需要的名单隶属）。 */
-interface AuditVerdict {
-  domain: string;
-  score: number;
-  level: Level;
-  reasons: string[];
-  sourceKind: string;
-  creationDate?: string;
-  inWhitelist: boolean;
-  inBlocklist: boolean;
-}
-
-/** /api/citation-auditor/audit 的负载。 */
-interface AuditData {
-  ok: boolean;
-  enabled: boolean;
-  mode: CitationSettingsSection["mode"];
-  blocklistEnabled: boolean;
-  summary: string;
-  verdicts: AuditVerdict[];
-}
-
-/** /api/citation-auditor/status 的负载（设置视图数据）。 */
-interface StatusData {
-  ok: boolean;
-  settings: CitationSettingsSection;
-  counts: { whitelist: number; blocklist: number };
-  files: Record<string, string>;
-  ageQueryReady: boolean;
-}
-
-/** 弹窗描述：标题 + 正文 + 按钮组。 */
-interface ModalSpec {
-  title: string;
-  body: string;
-  buttons: { label: string; onClick: () => void }[];
-}
-
-/** 悬浮窗位置：right/bottom 锚定（窗口缩放时天然贴边）。 */
-interface FloatPos {
-  right: number;
-  bottom: number;
-}
+import { MONO, BLOCKLIST_FIELD, MODE_LABEL } from "./constants.js";
+import {
+  FloatBall,
+  BALL_SIZE,
+  AuditPanel,
+  SettingsPanel,
+  ConfirmDialog,
+  type AuditData,
+  type StatusData,
+  type ModalSpec,
+  type FloatPos,
+} from "./float/index.js";
+import { clamp } from "./float/styles.js";
 
 const POS_KEY = "citation-auditor-float-pos";
 const OPEN_KEY = "citation-auditor-float-open";
 const DEFAULT_POS: FloatPos = { right: 24, bottom: 24 };
 /** 视口内边距与悬浮球占位（clamp 用的最小/最大余量）。 */
 const MARGIN = 12;
-const BALL_SIZE = 44;
-
-const MONO = "ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace";
-
-const LEVEL_COLOR: Record<Level, string> = {
-  trusted: "#58a65c",
-  suspicious: "#d98a2b",
-  warning: "#d9a036",
-  critical: "#e05555",
-};
-
-const button: React.CSSProperties = {
-  fontFamily: MONO,
-  fontSize: 12,
-  background: "none",
-  border: "1px solid currentcolor",
-  borderRadius: 3,
-  color: "inherit",
-  cursor: "pointer",
-  padding: "1px 8px",
-  marginRight: 6,
-  marginTop: 2,
-};
-
-const dimButton: React.CSSProperties = { ...button, color: "gray" };
-
-const link: React.CSSProperties = {
-  background: "none",
-  border: "none",
-  color: "#4aa3ff",
-  cursor: "pointer",
-  font: "inherit",
-  padding: 0,
-  textDecoration: "underline",
-};
-
-const dim: React.CSSProperties = { color: "gray" };
-
-/** 模式 → 设置文档里对应"该模式拦截名单开关"的字段名（弹窗"开启并保存"用）。 */
-const BLOCKLIST_FIELD: Record<CitationSettingsSection["mode"], keyof CitationSettingsSection> = {
-  whitelist: "blocklistEnabledWhitelist",
-  normal: "blocklistEnabledNormal",
-  simple: "blocklistEnabledSimple",
-};
-
-const MODE_LABEL: Record<CitationSettingsSection["mode"], string> = {
-  whitelist: "白名单模式",
-  normal: "普通模式",
-  simple: "简单模式",
-};
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.min(Math.max(v, lo), Math.max(lo, hi));
-}
 
 function loadPos(): FloatPos {
   try {
@@ -356,7 +270,7 @@ export function CitationAuditorFloatWindow(props: {
   );
 
   // 设置写入：走插件自有 /settings 端点（落盘 settings.json 唯一真源），不依赖 settings 服务
-  const writeSettings = useCallback((field: keyof CitationSettingsSection, value: boolean | CitationSettingsSection["mode"]): void => {
+  const writeSettings = useCallback((field: keyof CitationSettingsSection, value: boolean | number | string): void => {
     fetch("/api/citation-auditor/settings", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -378,7 +292,7 @@ export function CitationAuditorFloatWindow(props: {
   }, [fetchSettings, refresh]);
 
   const addBlocklist = useCallback(
-    (v: AuditVerdict): void => {
+    (v: { domain: string }): void => {
       // 弹窗被"仅保存"抑制过（本会话不再提示）→ 直接写入
       if (audit?.blocklistEnabled || suppressedModes.has(audit?.mode ?? "")) {
         mutate("block", v.domain);
@@ -438,29 +352,6 @@ export function CitationAuditorFloatWindow(props: {
     window.open(`https://${domain}`, "_blank", "noopener,noreferrer");
   }, []);
 
-  // 设置写入：走插件自有 /settings 端点（落盘 settings.json 唯一真源），不依赖 settings 服务
-  const setSetting = useCallback(
-    (field: keyof CitationSettingsSection, value: boolean | CitationSettingsSection["mode"]): void => {
-      writeSettings(field, value);
-    },
-    [writeSettings],
-  );
-
-  const testAge = useCallback((): void => {
-    setAgeTest({ running: true, result: null });
-    fetch("/api/citation-auditor/test-age", { method: "POST" })
-      .then((r) => (r.ok ? (r.json() as Promise<{ ok: boolean; creationDate?: string; error?: string }>) : Promise.reject(new Error(String(r.status)))))
-      .then((d) => {
-        setAgeTest({
-          running: false,
-          result: d.ok ? `✓ wikipedia.org 创建于 ${d.creationDate}` : `✗ ${d.error ?? "未知错误"}`,
-        });
-      })
-      .catch((err: unknown) => {
-        setAgeTest({ running: false, result: `✗ ${err instanceof Error ? err.message : String(err)}` });
-      });
-  }, []);
-
   const openFile = useCallback((file: string): void => {
     fetch("/api/citation-auditor/open-file", {
       method: "POST",
@@ -468,8 +359,6 @@ export function CitationAuditorFloatWindow(props: {
       body: JSON.stringify({ file }),
     }).catch(() => {});
   }, []);
-
-  const [ageTest, setAgeTest] = useState<{ running: boolean; result: string | null }>({ running: false, result: null });
 
   // ---- 位置与拖拽（dsh-pet PetSprite 模式）----
   const [pos, setPos] = useState<FloatPos>(loadPos);
@@ -526,70 +415,17 @@ export function CitationAuditorFloatWindow(props: {
 
   const verdicts = audit?.verdicts ?? [];
   const nonTrusted = verdicts.filter((v) => v.level !== "trusted").length;
-  const dotColor = failed
-    ? "#e05555"
-    : nonTrusted > 0
-      ? LEVEL_COLOR.critical
-      : verdicts.length > 0
-        ? LEVEL_COLOR.trusted
-        : "#888";
-
-  const shown = verdicts.filter((v) => !ignored.has(v.domain));
-  const s = settingsData?.settings;
 
   return (
     <>
       {!open ? (
-        // 悬浮球：拖拽移动，点击展开
-        <div
-          data-citation-auditor-ball
-          onPointerDown={ballDrag.onPointerDown}
-          onPointerMove={ballDrag.onPointerMove}
-          onPointerUp={ballDrag.onPointerUp}
-          style={{
-            position: "fixed",
-            right: pos.right,
-            bottom: pos.bottom,
-            width: BALL_SIZE,
-            height: BALL_SIZE,
-            borderRadius: "50%",
-            background: "var(--bg-color, #1e1e1e)",
-            color: "var(--fg-color, #ddd)",
-            border: `2px solid ${dotColor}`,
-            boxShadow: "0 2px 10px rgba(0,0,0,0.35)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            cursor: "grab",
-            userSelect: "none",
-            touchAction: "none",
-            zIndex: 2147483000,
-            fontSize: 20,
-          }}
-          title="引用来源威胁度（拖动移动，点击展开）"
-        >
-          🛡
-          {nonTrusted > 0 ? (
-            <span
-              style={{
-                position: "absolute",
-                top: -6,
-                right: -6,
-                minWidth: 18,
-                height: 18,
-                borderRadius: 9,
-                background: dotColor,
-                color: "#fff",
-                fontSize: 11,
-                lineHeight: "18px",
-                textAlign: "center",
-                padding: "0 4px",
-              }}
-            >
-              {nonTrusted}
-            </span>
-          ) : null}
-        </div>
+        <FloatBall
+          pos={pos}
+          nonTrusted={nonTrusted}
+          failed={failed}
+          hasVerdicts={verdicts.length > 0}
+          dragHandlers={ballDrag}
+        />
       ) : (
         // 展开面板：标题栏拖拽；正文 = 设置视图 或 审计列表（含名单操作按钮）
         <div
@@ -689,232 +525,30 @@ export function CitationAuditorFloatWindow(props: {
           </div>
 
           {settingsView ? (
-            // ---- 设置视图（面板内嵌；经 settings scope 写入，与设置卡片同链路）----
-            <div style={{ overflowY: "auto", padding: "8px 10px", lineHeight: 1.7 }}>
-              {settingsFailed ? (
-                <div style={{ color: "#e05555" }}>设置端点不可达（host 端点未就绪）。</div>
-              ) : s === undefined ? (
-                <div style={dim}>加载设置中…</div>
-              ) : (
-                <>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span>插件</span>
-                    <button
-                      type="button"
-                      style={s.enabled ? dimButton : button}
-                      onClick={() => setSetting("enabled", !s.enabled)}
-                    >
-                      {s.enabled ? "✓ 启用中（点击休眠）" : "已休眠（点击启用）"}
-                    </button>
-                  </div>
-                  <div style={{ marginTop: 6 }}>
-                    <div style={dim}>检测模式</div>
-                    {(Object.keys(MODE_LABEL) as CitationSettingsSection["mode"][]).map((m) => (
-                      <label key={m} style={{ display: "block", cursor: "pointer" }}>
-                        <input
-                          type="radio"
-                          name="ca-float-mode"
-                          checked={s.mode === m}
-                          onChange={() => setSetting("mode", m)}
-                        />
-                        {` ${MODE_LABEL[m]}`}
-                      </label>
-                    ))}
-                  </div>
-                  <div style={{ marginTop: 6 }}>
-                    <div style={dim}>拦截名单（每模式独立开关）</div>
-                    <label style={{ display: "block", cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={s.blocklistEnabledWhitelist}
-                        onChange={(e) => setSetting("blocklistEnabledWhitelist", e.target.checked)}
-                      />
-                      {" 白名单模式"}
-                    </label>
-                    <label style={{ display: "block", cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={s.blocklistEnabledNormal}
-                        onChange={(e) => setSetting("blocklistEnabledNormal", e.target.checked)}
-                      />
-                      {" 普通模式"}
-                    </label>
-                    <label style={{ display: "block", cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={s.blocklistEnabledSimple}
-                        onChange={(e) => setSetting("blocklistEnabledSimple", e.target.checked)}
-                      />
-                      {" 简单模式"}
-                    </label>
-                    <label style={{ display: "block", cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={s.whitelistEnabledNormal}
-                        onChange={(e) => setSetting("whitelistEnabledNormal", e.target.checked)}
-                      />
-                      {" 普通模式白名单免查加速"}
-                    </label>
-                  </div>
-                  <div style={{ marginTop: 6 }}>
-                    <div style={dim}>年龄查询</div>
-                    <label style={{ display: "block", cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={s.ageQueryEnabled}
-                        onChange={(e) => setSetting("ageQueryEnabled", e.target.checked)}
-                      />
-                      {" 启用（ageQuery.js）"}
-                    </label>
-                    <div style={{ marginTop: 2 }}>
-                      <button type="button" style={button} onClick={testAge} disabled={ageTest.running}>
-                        {ageTest.running ? "测试中…" : "测试（wikipedia.org）"}
-                      </button>
-                      {ageTest.result !== null ? <span style={dim}>{ageTest.result}</span> : null}
-                    </div>
-                  </div>
-                  <div style={{ marginTop: 6 }}>
-                    <div style={dim}>{`名单: 白名单 ${settingsData?.counts.whitelist ?? "?"} · 拦截 ${settingsData?.counts.blocklist ?? "?"}`}</div>
-                    <div style={{ marginTop: 2 }}>
-                      {(["whitelist", "blocklist", "settings", "ageQuery"] as const).map((f) => (
-                        <button key={f} type="button" style={button} onClick={() => openFile(f)}>
-                          {f === "ageQuery" ? "编辑 ageQuery.js" : `打开 ${f}.json`}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <div style={{ ...dim, marginTop: 6, fontSize: 11 }}>
-                    文件改完即生效；名单/设置均在 ~/.citation-auditor/ 下，归你所有。
-                  </div>
-                </>
-              )}
-            </div>
+            <SettingsPanel
+              settingsData={settingsData}
+              settingsFailed={settingsFailed}
+              onSetSetting={writeSettings}
+              onOpenFile={openFile}
+            />
           ) : (
-            // ---- 审计列表 + 名单操作按钮 ----
-            <div style={{ overflowY: "auto", padding: "8px 10px", lineHeight: 1.6 }}>
-              {analyzing ? <div style={{ color: "gray" }}>⏳ 分析最近回复中…</div> : null}
-              {!analyzing && failed ? (
-                <div style={{ color: "#e05555" }}>数据端点不可达（host 端点未就绪或已停用）。</div>
-              ) : null}
-              {!analyzing && !failed && audit !== undefined && !audit.enabled ? (
-                <div style={{ color: "gray" }}>插件已休眠（⚙ 设置里可重新开启）。</div>
-              ) : null}
-              {!analyzing && !failed && audit !== undefined && audit.enabled && shown.length === 0 ? (
-                <div style={{ color: "gray" }}>（最近回复里没有网址，或全部已忽略）</div>
-              ) : null}
-              {!analyzing && !failed && audit === undefined ? (
-                <div style={{ color: "gray" }}>等最近一次回复定稿后自动分析。</div>
-              ) : null}
-              {shown.map((v) => (
-                <div key={v.domain} style={{ margin: "4px 0" }}>
-                  <div>
-                    <span style={{ color: LEVEL_COLOR[v.level] }}>{LEVEL_LABEL[v.level]}</span>
-                    {` ${v.score}分  `}
-                    <button type="button" style={link} title="新标签打开" onClick={() => openDomain(v.domain)}>
-                      {v.domain}
-                    </button>
-                  </div>
-                  {v.reasons.length > 0 || v.creationDate !== undefined ? (
-                    <div style={{ paddingLeft: "1.2em", color: "gray", fontSize: 12 }}>
-                      {v.reasons.length > 0 ? `原因: ${v.reasons.join(" + ")}` : ""}
-                      {v.creationDate !== undefined ? `（创建于 ${v.creationDate.slice(0, 10)}）` : ""}
-                    </div>
-                  ) : null}
-                  {v.level !== "trusted" ? (
-                    <div style={{ paddingLeft: "1.2em" }}>
-                      {v.inBlocklist ? (
-                        <button
-                          type="button"
-                          style={dimButton}
-                          disabled={busy}
-                          onClick={() => confirmRemove("拦截名单", v.domain, "unblock")}
-                        >
-                          ✓ 已拦截
-                        </button>
-                      ) : (
-                        <button type="button" style={button} disabled={busy} onClick={() => addBlocklist(v)}>
-                          ➕ 加入拦截名单
-                        </button>
-                      )}
-                      {v.inWhitelist ? (
-                        <button
-                          type="button"
-                          style={dimButton}
-                          disabled={busy}
-                          onClick={() => confirmRemove("白名单", v.domain, "unwhitelist")}
-                        >
-                          ✓ 已白名单
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          style={button}
-                          disabled={busy}
-                          onClick={() => mutate("whitelist", v.domain)}
-                        >
-                          ➕ 加入白名单
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        style={dimButton}
-                        onClick={() => setIgnored((s) => new Set([...s, v.domain]))}
-                      >
-                        忽略
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
-              ))}
-              {verdicts.length > 0 ? (
-                <div style={{ marginTop: 6, color: "gray", fontSize: 11 }}>
-                  分数与 citation_audit 工具一致；名单写入立即生效。
-                </div>
-              ) : null}
-            </div>
+            <AuditPanel
+              analyzing={analyzing}
+              failed={failed}
+              auditEnabled={audit?.enabled}
+              verdicts={verdicts}
+              ignored={ignored}
+              busy={busy}
+              onAddBlocklist={addBlocklist}
+              onConfirmRemove={confirmRemove}
+              onAddWhitelist={(domain) => mutate("whitelist", domain)}
+              onIgnore={(domain) => setIgnored((s) => new Set([...s, domain]))}
+              onOpenDomain={openDomain}
+            />
           )}
 
           {modal !== undefined ? (
-            <div
-              role="dialog"
-              aria-modal="true"
-              style={{
-                position: "fixed",
-                inset: 0,
-                background: "rgba(0,0,0,0.45)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                zIndex: 9999,
-              }}
-              onClick={() => setModal(undefined)}
-            >
-              <div
-                style={{
-                  fontFamily: MONO,
-                  fontSize: 13,
-                  lineHeight: 1.7,
-                  border: "3px double currentcolor",
-                  borderRadius: 4,
-                  padding: "10px 14px",
-                  whiteSpace: "pre-wrap",
-                  background: "var(--bg-color, #1e1e1e)",
-                  color: "var(--fg-color, #ddd)",
-                  maxWidth: 460,
-                }}
-                onClick={(e) => e.stopPropagation()}
-              >
-                <div>{modal.title}</div>
-                <div style={{ ...dim, margin: "6px 0" }}>{modal.body}</div>
-                <div style={{ marginTop: 6 }}>
-                  {modal.buttons.map((b) => (
-                    <button key={b.label} type="button" style={button} onClick={b.onClick}>
-                      {b.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
+            <ConfirmDialog modal={modal} onClose={() => setModal(undefined)} />
           ) : null}
         </div>
       )}

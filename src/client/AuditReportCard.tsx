@@ -24,42 +24,14 @@ import { useCallback, useEffect, useState } from "react";
 import type { ToolCallViewProps } from "@deepseek-ai/dsh-client-ui-tool/client";
 import type { CitationSettingsSection } from "../settingsSection.js";
 import { LEVEL_LABEL, type Level } from "../auditor/types.js";
+import { SOURCE_KIND_LABEL, ENFORCEMENT_LABEL } from "../auditor/types.js";
+import { LEVEL_COLOR, BLOCKLIST_FIELD, MODE_LABEL, MONO } from "./constants.js";
+import type { AuditVerdict, AuditData, ModalSpec } from "./float/types.js";
 
 /** 组件经注册 inject 拿到的脸（设置/名单读写走插件自有 /api 端点，无需注入）。 */
 export interface AuditRowInject {}
 
 type AuditRowProps = ToolCallViewProps & AuditRowInject;
-
-/** GET /api/citation-auditor/audit 负载里的单条判决。 */
-interface AuditVerdict {
-  domain: string;
-  score: number;
-  level: Level;
-  reasons: string[];
-  sourceKind: string;
-  creationDate?: string;
-  inWhitelist: boolean;
-  inBlocklist: boolean;
-}
-
-/** GET /api/citation-auditor/audit 的负载。 */
-interface AuditData {
-  ok: boolean;
-  enabled: boolean;
-  mode: CitationSettingsSection["mode"];
-  blocklistEnabled: boolean;
-  summary: string;
-  verdicts: AuditVerdict[];
-}
-
-/** 弹窗描述：标题 + 正文 + 按钮组。 */
-interface ModalSpec {
-  title: string;
-  body: string;
-  buttons: { label: string; onClick: () => void }[];
-}
-
-const MONO = "ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace";
 
 const box: React.CSSProperties = {
   fontFamily: MONO,
@@ -96,26 +68,6 @@ const link: React.CSSProperties = {
 };
 
 const dim: React.CSSProperties = { color: "gray" };
-
-const LEVEL_COLOR: Record<Level, string> = {
-  trusted: "#58a65c",
-  suspicious: "#d98a2b",
-  warning: "#d9a036",
-  critical: "#e05555",
-};
-
-/** 模式 → 设置文档里对应"该模式拦截名单开关"的字段名。 */
-const BLOCKLIST_FIELD: Record<CitationSettingsSection["mode"], keyof CitationSettingsSection> = {
-  whitelist: "blocklistEnabledWhitelist",
-  normal: "blocklistEnabledNormal",
-  simple: "blocklistEnabledSimple",
-};
-
-const MODE_LABEL: Record<CitationSettingsSection["mode"], string> = {
-  whitelist: "白名单模式",
-  normal: "普通模式",
-  simple: "简单模式",
-};
 
 /** 从工具入参还原审计文本；解析失败返回 undefined（退化为纯报表展示）。 */
 function textFromBlock(block: AuditRowProps["block"]): string | undefined {
@@ -334,8 +286,11 @@ export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
             </div>
             {v.reasons.length > 0 ? <div style={{ paddingLeft: "1.5em" }}>原因: {v.reasons.join(" + ")}</div> : null}
             <div style={{ paddingLeft: "1.5em", ...dim }}>
-              {`来源类型: ${v.sourceKind}`}
+              {`来源类型: ${SOURCE_KIND_LABEL[(v.sourceKind as keyof typeof SOURCE_KIND_LABEL) ?? "unverifiable"]}`}
               {v.creationDate !== undefined ? `（创建于 ${v.creationDate.slice(0, 10)}）` : ""}
+              {v.inBlocklist && v.action !== undefined && v.action !== "allow"
+                ? `［命中拦截名单：${ENFORCEMENT_LABEL[v.action]}］`
+                : ""}
             </div>
             {v.level !== "trusted" ? (
               <div style={{ paddingLeft: "1.5em", marginTop: 2 }}>

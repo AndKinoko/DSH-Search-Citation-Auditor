@@ -1,7 +1,7 @@
 /**
- * 真实拦截（web 访问阻断）：在 tools/pre-execute 阶段检查 web 工具（web_search /
- * web_fetch 等）参数里的 URL 或裸域名，命中拦截名单（精确域名或 TLD）即返回
- * deny 决策——模型无法再访问被拦域名。
+ * 真实拦截（web 访问处置）：在 tools/pre-execute 阶段检查 web 工具（web_search /
+ * web_fetch 等）参数里的 URL 或裸域名，命中拦截名单（精确域名或 TLD）即按处置
+ * 策略返回决策——deny=直接拦截，ask=需确认，allow=仅提醒（放行，只在报表标红）。
  *
  * 只拦 web 工具：不扫描任意工具参数，避免误伤插件自己的 citation_audit（它审计
  * 的文本本来就可能含被拦域名）。pwsh/curl 等 shell 通道不在拦截范围（属沙箱层）。
@@ -13,12 +13,22 @@
 import { scan } from "./auditor/scanner.js";
 import { get as pslGet } from "psl";
 import type { Auditor } from "./auditor/service.js";
+import { DEFAULT_ENFORCEMENT } from "./auditor/types.js";
 
 /** deny 决策的最小形状（与 dsh-tools 的 PreToolDecision 一致）。 */
 export interface DenyDecision {
   kind: "deny";
   reason: string;
 }
+
+/** ask 决策：需经审批服务确认，否则拒绝（与 dsh-tools 的 PreToolDecision 一致）。 */
+export interface AskDecision {
+  kind: "ask";
+  reason?: string;
+}
+
+/** 拦截决策：deny=直接拦截，ask=需确认。allow=放行（返回 undefined，由调用方 next()）。 */
+export type BlockDecision = DenyDecision | AskDecision;
 
 /** web 访问类工具（exec.name 命中即纳入拦截检查）。 */
 const WEB_TOOL_RE = /^tool:web_|web[-_](search|fetch|browse)|^web[-_](search|fetch|browse)/i;
@@ -31,9 +41,9 @@ const BARE_DOMAIN_RE = /(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}/gi;
  * @param auditor - 审计服务（名单真源）。
  * @param name - 工具名（wire 名）。
  * @param args - 工具参数（任意形状，序列化后提取域名）。
- * @returns 命中时返回 deny 决策，否则 undefined（放行）。
+ * @returns 命中时按处置策略返回 deny/ask 决策，否则 undefined（放行）。
  */
-export function blockedToolDecision(auditor: Auditor, name: string | undefined, args: unknown): DenyDecision | undefined {
+export function blockedToolDecision(auditor: Auditor, name: string | undefined, args: unknown): BlockDecision | undefined {
   if (typeof name !== "string" || !WEB_TOOL_RE.test(name)) return undefined;
   let text: string;
   try {
@@ -47,8 +57,16 @@ export function blockedToolDecision(auditor: Auditor, name: string | undefined, 
     const d = pslGet(m.toLowerCase());
     if (d) candidates.add(d); // 裸域名归一化
   }
+  const action = auditor.getSettings().enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist;
+  if (action === "allow") return undefined; // 仅提醒：报表标红，不拦截
   for (const domain of candidates) {
     if (auditor.rules.blocks(domain)) {
+      if (action === "ask") {
+        return {
+          kind: "ask",
+          reason: `域名 ${domain} 在 Citation Auditor 拦截名单中，需确认后访问`,
+        };
+      }
       return {
         kind: "deny",
         reason: `域名 ${domain} 在 Citation Auditor 拦截名单中，已禁止访问`,

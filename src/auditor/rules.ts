@@ -6,8 +6,8 @@
  * 首次运行写入预写内容（whitelist 预写 wikipedia.org 等权威域名，blocklist 预写 .xyz/.top）。
  * 升级永不覆盖；开关与记录解耦。
  */
-import type { ListEntry, Settings } from "./types.js";
-import { DEFAULT_SETTINGS } from "./types.js";
+import type { ListEntry, Settings, ScoringParams } from "./types.js";
+import { DEFAULT_SETTINGS, DEFAULT_SCORING, DEFAULT_ENFORCEMENT } from "./types.js";
 import type { KeyValueStore } from "../storage.js";
 import { parse as pslParse } from "psl";
 
@@ -54,6 +54,8 @@ export class RuleStore {
         whitelistEnabled: { ...DEFAULT_SETTINGS.whitelistEnabled, ...(parsed.whitelistEnabled ?? {}) },
         ageQuery: { ...DEFAULT_SETTINGS.ageQuery, ...(parsed.ageQuery ?? {}) },
         onFailure: parsed.onFailure === "treatAsNew" ? "treatAsNew" : DEFAULT_SETTINGS.onFailure,
+        scoring: parsed.scoring ? { ...DEFAULT_SCORING, ...parsed.scoring } : undefined,
+        enforcement: parsed.enforcement ? { ...DEFAULT_ENFORCEMENT, ...parsed.enforcement } : undefined,
       };
     } catch {
       return { ...DEFAULT_SETTINGS };
@@ -72,12 +74,13 @@ export class RuleStore {
     return this.readList(K_BLOCK);
   }
 
-  /** 加入白名单（数据立即落盘）。 */
-  addToWhitelist(domain: string, reason: string): ListEntry[] {
+  /** 加入白名单（数据立即落盘）。返回 null 表示格式非法。 */
+  addToWhitelist(domain: string, reason: string): ListEntry[] | null {
     return this.addToList(K_WHITE, domain, reason);
   }
 
-  addToBlocklist(domain: string, reason: string): ListEntry[] {
+  /** 加入拦截名单（数据立即落盘）。返回 null 表示格式非法。 */
+  addToBlocklist(domain: string, reason: string): ListEntry[] | null {
     return this.addToList(K_BLOCK, domain, reason);
   }
 
@@ -109,14 +112,18 @@ export class RuleStore {
 
   /**
    * 域名是否命中拦截名单（精确域名或 TLD 后缀命中）。
-   * 用于真实拦截：命中即禁止模型经 web 工具访问该域名。
+   * 用于真实拦截：命中即按处置策略阻止或提醒模型经 web 工具访问该域名。
    */
   blocks(domain: string): boolean {
-    const { domains, tlds } = this.blocklistSets();
-    if (domains.has(domain)) return true;
+    return this.blocksWith(this.blocklistSets(), domain);
+  }
+
+  /** 用已解析的名单集合判定（service 循环内复用，避免重复读盘）。 */
+  blocksWith(sets: { domains: Set<string>; tlds: Set<string> }, domain: string): boolean {
+    if (sets.domains.has(domain)) return true;
     const tld = pslParse(domain).tld;
     if (!tld) return false;
-    for (const entry of tlds) {
+    for (const entry of sets.tlds) {
       const suffix = entry.replace(/^\./, "").toLowerCase();
       if (suffix !== "" && (tld === suffix || tld.endsWith(`.${suffix}`))) return true;
     }
@@ -134,8 +141,22 @@ export class RuleStore {
     }
   }
 
-  private addToList(key: string, domain: string, reason: string): ListEntry[] {
+  private addToList(key: string, domain: string, reason: string): ListEntry[] | null {
     domain = domain.trim().toLowerCase();
+    // 基本格式校验：空字符串直接拒绝；TLD 条目必须以 . 开头，普通域名必须包含 .
+    if (!domain) return null;
+    if (domain.startsWith(".")) {
+      // TLD 条目：去掉前缀后不能为空
+      if (domain.length < 2) return null;
+      // TLD 条目不允许包含空格、控制字符等非法字符
+      if (/[^\x20-\x7e]/.test(domain) || /\s/.test(domain)) return null;
+    } else if (!domain.includes(".")) {
+      // 普通域名必须包含点号
+      return null;
+    } else {
+      // 普通域名不允许包含空格、控制字符、@/#/? 等非法字符
+      if (/[^\x20-\x7e]/.test(domain) || /[\s@#?]/.test(domain)) return null;
+    }
     const list = this.readList(key).filter((e) => e.domain !== domain);
     list.push({ domain, reason: reason.trim() || "手动标记", date: new Date().toISOString() });
     this.storage.setItem(key, JSON.stringify(list));

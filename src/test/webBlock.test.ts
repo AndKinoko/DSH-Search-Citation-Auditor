@@ -80,3 +80,70 @@ test("blockedToolDecision：web_search 查询里带被拦裸域名也拒绝；�
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("blockedToolDecision：循环引用参数不抛出，安全放行", () => {
+  const dir = mkdtempSync(join(tmpdir(), "citation-auditor-test-"));
+  try {
+    const auditor = makeAuditor(dir);
+    auditor.rules.addToBlocklist("evil.com", "测试");
+    // 循环引用对象会导致 JSON.stringify 抛出，应安全放行
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    assert.equal(blockedToolDecision(auditor, "web_fetch", circular), undefined, "循环引用应放行");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("blockedToolDecision：web_browse 工具也纳入拦截", () => {
+  const dir = mkdtempSync(join(tmpdir(), "citation-auditor-test-"));
+  try {
+    const auditor = makeAuditor(dir);
+    auditor.rules.addToBlocklist("malware.example", "测试");
+    assert.equal(blockedToolDecision(auditor, "web_browse", { url: "https://malware.example/page" })?.kind, "deny", "web_browse 也应拦截");
+    assert.equal(blockedToolDecision(auditor, "tool:web_browse", { url: "https://malware.example/page" })?.kind, "deny", "tool:web_browse 前缀也应拦截");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("blockedToolDecision：单个工具参数含多个被拦域名，返回第一个命中的", () => {
+  const dir = mkdtempSync(join(tmpdir(), "citation-auditor-test-"));
+  try {
+    const auditor = makeAuditor(dir);
+    auditor.rules.addToBlocklist("evil1.example", "测试1");
+    auditor.rules.addToBlocklist("evil2.example", "测试2");
+    const denied = blockedToolDecision(auditor, "web_fetch", {
+      url: "https://evil1.example/a and https://evil2.example/b",
+    });
+    assert.ok(denied, "至少命中一个");
+    assert.equal(denied!.kind, "deny");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("v0.3 处置策略：ask 返回需确认，allow 直接放行", () => {
+  const dir = mkdtempSync(join(tmpdir(), "citation-auditor-test-"));
+  try {
+    const auditor = makeAuditor(dir);
+    auditor.rules.addToBlocklist("evil.example", "测试");
+
+    const s = auditor.getSettings();
+    auditor.rules.saveSettings({ ...s, enforcement: { blocklist: "ask" } });
+    const asked = blockedToolDecision(auditor, "web_fetch", { url: "https://evil.example/x" });
+    assert.ok(asked, "ask 策略下命中应返回决策");
+    assert.equal(asked!.kind, "ask");
+    assert.match((asked as { reason: string }).reason, /evil\.example/);
+
+    const s2 = auditor.getSettings();
+    auditor.rules.saveSettings({ ...s2, enforcement: { blocklist: "allow" } });
+    assert.equal(
+      blockedToolDecision(auditor, "web_fetch", { url: "https://evil.example/x" }),
+      undefined,
+      "allow 策略下仅提醒，不拦截",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

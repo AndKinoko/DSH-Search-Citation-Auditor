@@ -2,7 +2,7 @@
  * Auditor 服务：把纯函数模块组装成可运行的审计闭环。
  * 设计哲学：只检测、只呈现、不拦截，一切处置权归用户。工具是眼镜，不是过滤器。
  */
-import { scan } from "./scanner.js";
+import { scanDetailed, aggregateDomainSignals } from "./scanner.js";
 import { classify, sortByThreat } from "./scorer.js";
 import { renderReport, renderSummaryLine } from "./report.js";
 import { RuleStore } from "./rules.js";
@@ -10,6 +10,7 @@ import { WhoIsCache } from "./cache.js";
 import { makeAgeResolver } from "./ageQuery.js";
 import type { AgeQueryFile } from "./ageQueryFile.js";
 import type { ScanResult, Settings } from "./types.js";
+import { DEFAULT_ENFORCEMENT, ENFORCEMENT_LABEL } from "./types.js";
 import type { KeyValueStore } from "../storage.js";
 
 export interface AuditOutcome {
@@ -66,6 +67,7 @@ export class Auditor {
       whitelistCount: this.rules.getWhitelist().length,
       blocklistCount: this.rules.getBlocklist().length,
       ageQueryEnabled: s.ageQuery.enabled && this.ageQueryFile.read().trim() !== "",
+      enforcement: s.enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist,
     };
   }
 
@@ -80,7 +82,7 @@ export class Auditor {
         summary: null,
       };
     }
-    const { urls, domains } = scan(text);
+    const { urls, domains, details } = scanDetailed(text);
     const code = this.ageQueryFile.read(); // 实时读取，编辑 ageQuery.js 即生效
     const resolver = makeAgeResolver({
       code,
@@ -97,7 +99,7 @@ export class Auditor {
     const failedAges = new Set<string>();
     const cacheHits = new Set<string>();
     await mapLimit(domains, AGE_QUERY_CONCURRENCY, async (domain) => {
-      if (needsAge) {
+      if (needsAge && ageAttempted) {
         // 查询前先看一眼缓存：命中且结果一致 → 来源标"缓存"而非"API查询"
         const pre = this.cache.read(domain);
         const cachedOk = pre?.kind === "ok" && typeof pre.creationDate === "string";
@@ -105,41 +107,48 @@ export class Auditor {
         if (cd) {
           creationDates.set(domain, cd);
           if (cachedOk && pre.creationDate === cd) cacheHits.add(domain);
-        } else if (ageAttempted) {
+        } else {
           failedAges.add(domain); // 查询跑过但没拿到日期（失败/无数据）
         }
       }
     });
 
+    const blockSets = this.rules.blocklistSets();
+    const { domains: blockDomains, tlds: blockTlds } = blockSets;
+    const whitelist = this.rules.whitelistSet();
+    const enforcement = s.enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist;
     const verdicts = domains.map((domain) => {
       const v = classify({
         domain,
         mode: s.mode,
         settings: s,
-        blocklist: this.rules.blocklistSets().domains,
-        blockedTlds: this.rules.blocklistSets().tlds,
-        whitelist: this.rules.whitelistSet(),
+        blocklist: blockDomains,
+        blockedTlds: blockTlds,
+        whitelist,
         creationDate: creationDates.get(domain),
         ageUnavailable: creationDates.has(domain)
           ? undefined
           : ageAttempted && failedAges.has(domain)
             ? "failed"
             : "disabled",
+        urlSignals: aggregateDomainSignals(details, domain),
       });
       // scorer 只能标"API查询"（它不认识缓存）；缓存命中的判决在这里改标"缓存"
-      if (v.sourceKind === "API查询" && cacheHits.has(domain)) v.sourceKind = "缓存";
+      if (v.sourceKind === "api_query" && cacheHits.has(domain)) v.sourceKind = "cache";
+      // 处置动作：命中拦截名单（精确或 TLD）即按策略标记，否则仅提醒
+      v.action = this.rules.blocksWith(blockSets, domain) ? enforcement : "allow";
       return v;
     });
     const ordered = sortByThreat(verdicts);
     return {
       result: { urls, domains, verdicts: ordered },
-      report: renderReport(ordered),
+      report: renderReport(ordered, { enforcement: ENFORCEMENT_LABEL[enforcement] }),
       summary: renderSummaryLine(ordered),
     };
   }
 }
 
-/** 带并发上限的 map：任一元素失败则整体快速失败。 */
+/** 带并发上限的 map：单元素失败不中断其他元素的处理。 */
 async function mapLimit<T>(
   items: readonly T[],
   concurrency: number,
@@ -152,7 +161,11 @@ async function mapLimit<T>(
     workers.push((async () => {
       while (queue.length > 0) {
         const item = queue.shift()!;
-        await fn(item);
+        try {
+          await fn(item);
+        } catch {
+          // 单个元素失败不中断其他元素的处理
+        }
       }
     })());
   }

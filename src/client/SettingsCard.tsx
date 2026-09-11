@@ -12,6 +12,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import type { CitationSettingsSection } from "../settingsSection.js";
+import { ENFORCEMENT_LABEL, type EnforcementAction } from "../auditor/types.js";
 
 /** 卡片经 slot inject 拿到的脸（当前设置写入走插件自有 /settings 端点，不依赖 settings 服务）。 */
 export interface CardInject {} 
@@ -87,6 +88,24 @@ const MODES: ReadonlyArray<{
   { key: "simple", title: "简单模式", brief: "2023年后注册的域名一律标红" },
 ];
 
+/** 拦截策略三档（与 host EnforcementAction 对齐）。 */
+const ENFORCEMENT_OPTIONS: ReadonlyArray<{ key: EnforcementAction; brief: string }> = [
+  { key: "allow", brief: "只在报表标红，不阻止 web 访问" },
+  { key: "ask", brief: "命中时需确认后才访问" },
+  { key: "deny", brief: "命中时直接拒绝 web 访问" },
+];
+
+/** 高级阈值字段（与 settingsSection clamp 对齐）。 */
+const SCORING_FIELDS: ReadonlyArray<{ key: keyof CitationSettingsSection; label: string; min: number; max: number }> = [
+  { key: "scoringCutoffYear", label: "注册年份分界线", min: 2000, max: 2100 },
+  { key: "scoringTldTrustBonus", label: "高风险TLD加分", min: 0, max: 100 },
+  { key: "scoringPatternBonus", label: "连字符/数字加分", min: 0, max: 100 },
+  { key: "scoringPostCutoffBonus", label: "分界线后注册加分", min: 0, max: 100 },
+  { key: "scoringUrlIpBonus", label: "IP直连加分", min: 0, max: 100 },
+  { key: "scoringUrlShortenerBonus", label: "短链加分", min: 0, max: 100 },
+  { key: "scoringUrlTrackingBonus", label: "追踪参数加分", min: 0, max: 100 },
+];
+
 /** 简单模式的纯说明页内容（设计规则 4：唯一无编辑内容的页面）。 */
 function SimpleModeDetail({ ageQueryReady }: { ageQueryReady: boolean }): React.ReactElement {
   return (
@@ -103,6 +122,7 @@ export function CitationSettingsCard(_props: CardInject): React.ReactElement {
   const [status, setStatus] = useState<StatusPayload | undefined>(undefined);
   const [notice, setNotice] = useState<string>("");
   const [detailsOpen, setDetailsOpen] = useState<CitationSettingsSection["mode"] | undefined>(undefined);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [test, setTest] = useState<TestOutcome>({ running: false });
 
   const refreshStatus = useCallback((): void => {
@@ -335,6 +355,54 @@ export function CitationSettingsCard(_props: CardInject): React.ReactElement {
       </Row>
       {test.message !== undefined && (
         <div style={{ margin: "0 0 0 1.5em", color: test.ok ? "inherit" : "#e08040" }}>{test.message}</div>
+      )}
+      <Row>
+        <span style={sectionRule}>{"── 拦截策略 ──"}</span>
+      </Row>
+      {ENFORCEMENT_OPTIONS.map((o) => {
+        const selected = value.enforcementBlocklist === o.key;
+        return (
+          <Row key={o.key}>
+            <button
+              type="button"
+              style={rowLabel}
+              disabled={!writable}
+              onClick={() => set("enforcementBlocklist", o.key)}
+            >
+              {radio(selected)} {ENFORCEMENT_LABEL[o.key]}（{o.key}）
+            </button>
+            <div style={{ ...dim, margin: "0 0 0 1.5em" }}>{o.brief}</div>
+          </Row>
+        );
+      })}
+      <Row>
+        <span style={sectionRule}>{"── 高级阈值 ──"}</span>{" "}
+        <button type="button" style={rowButton} onClick={() => setAdvancedOpen(!advancedOpen)}>
+          [{advancedOpen ? "收起 ▾" : "展开 ▸"}]
+        </button>
+      </Row>
+      {advancedOpen &&
+        SCORING_FIELDS.map((f) => (
+          <Row key={f.key}>
+            <span style={{ margin: "0 0 0 1.5em" }}>
+              {f.label}（{f.min}–{f.max}）:{" "}
+            </span>
+            <input
+              type="number"
+              min={f.min}
+              max={f.max}
+              value={Number(value[f.key])}
+              disabled={!writable}
+              style={{ fontFamily: MONO, fontSize: 13, width: 80 }}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isFinite(n)) set(f.key, Math.min(f.max, Math.max(f.min, Math.round(n))) as never);
+              }}
+            />
+          </Row>
+        ))}
+      {advancedOpen && (
+        <div style={{ ...dim, margin: "0 0 0 1.5em" }}>其余 scoring 键直接改 settings.json 即生效。</div>
       )}
       {status !== undefined && (
         <div style={{ ...dim, margin: 0 }}>

@@ -14,6 +14,7 @@
 import Schema from "@deepseek-ai/schemastery";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Settings } from "./auditor/types.js";
+import { DEFAULT_ENFORCEMENT, DEFAULT_SCORING, type EnforcementAction } from "./auditor/types.js";
 
 /** client 可见的扁平 section 形状（设置文档用户层存的就是它）。 */
 export interface CitationSettingsSection {
@@ -24,6 +25,16 @@ export interface CitationSettingsSection {
   blocklistEnabledSimple: boolean;
   whitelistEnabledNormal: boolean;
   ageQueryEnabled: boolean;
+  /** 拦截策略：allow=仅提醒，ask=需确认，deny=直接拦截。 */
+  enforcementBlocklist: EnforcementAction;
+  /** 评分阈值（高级）：设置面板折叠区可调，直接改 settings.json.scoring 即生效。 */
+  scoringCutoffYear: number;
+  scoringTldTrustBonus: number;
+  scoringPatternBonus: number;
+  scoringPostCutoffBonus: number;
+  scoringUrlIpBonus: number;
+  scoringUrlShortenerBonus: number;
+  scoringUrlTrackingBonus: number;
 }
 
 /** 设置命名空间：kebab-case，client 侧 settingsScope.bind 用同名。 */
@@ -41,11 +52,27 @@ export function makeSectionSchema(): Schema<CitationSettingsSection> {
     blocklistEnabledSimple: Schema.boolean().default(true).description("简单模式下启用拦截名单"),
     whitelistEnabledNormal: Schema.boolean().default(true).description("普通模式白名单免查加速"),
     ageQueryEnabled: Schema.boolean().default(false).description("启用年龄查询片段"),
+    enforcementBlocklist: Schema.union(["allow", "ask", "deny"] as const)
+      .default(DEFAULT_ENFORCEMENT.blocklist)
+      .description("拦截策略（allow=仅提醒，ask=需确认，deny=直接拦截）"),
+    scoringCutoffYear: Schema.number().default(DEFAULT_SCORING.cutoffYear).description("注册年份分界线（此年及以后注册加分）"),
+    scoringTldTrustBonus: Schema.number().default(DEFAULT_SCORING.tldTrustBonus).description("高风险 TLD 加分"),
+    scoringPatternBonus: Schema.number().default(DEFAULT_SCORING.patternBonus).description("连字符/数字模式加分"),
+    scoringPostCutoffBonus: Schema.number().default(DEFAULT_SCORING.postCutoffBonus).description("分界线后注册加分"),
+    scoringUrlIpBonus: Schema.number().default(DEFAULT_SCORING.urlIpBonus).description("IP 直连加分"),
+    scoringUrlShortenerBonus: Schema.number().default(DEFAULT_SCORING.urlShortenerBonus).description("短链域名加分"),
+    scoringUrlTrackingBonus: Schema.number().default(DEFAULT_SCORING.urlTrackingBonus).description("追踪参数加分"),
   }) as Schema<CitationSettingsSection>;
+}
+
+function clampInt(v: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? Math.round(v) : fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 /** 插件 Settings → 扁平 section（挂载时的 base 层）。 */
 export function settingsToSection(s: Settings): CitationSettingsSection {
+  const scoring = { ...DEFAULT_SCORING, ...(s.scoring ?? {}) };
   return {
     enabled: s.enabled,
     mode: s.mode,
@@ -54,11 +81,20 @@ export function settingsToSection(s: Settings): CitationSettingsSection {
     blocklistEnabledSimple: s.blocklistEnabled.simple,
     whitelistEnabledNormal: s.whitelistEnabled.normal,
     ageQueryEnabled: s.ageQuery.enabled,
+    enforcementBlocklist: s.enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist,
+    scoringCutoffYear: scoring.cutoffYear,
+    scoringTldTrustBonus: scoring.tldTrustBonus,
+    scoringPatternBonus: scoring.patternBonus,
+    scoringPostCutoffBonus: scoring.postCutoffBonus,
+    scoringUrlIpBonus: scoring.urlIpBonus,
+    scoringUrlShortenerBonus: scoring.urlShortenerBonus,
+    scoringUrlTrackingBonus: scoring.urlTrackingBonus,
   };
 }
 
-/** 扁平 section → 插件 Settings（保留不归设置面板管的字段，如 ageQuery.code）。 */
+/** 扁平 section → 插件 Settings（保留不归设置面板管的字段，如 ageQuery.code 与未暴露的 scoring 键）。 */
 export function sectionToSettings(section: CitationSettingsSection, current: Settings): Settings {
+  const scoring = { ...DEFAULT_SCORING, ...(current.scoring ?? {}) };
   return {
     ...current,
     enabled: section.enabled,
@@ -70,6 +106,23 @@ export function sectionToSettings(section: CitationSettingsSection, current: Set
     },
     whitelistEnabled: { normal: section.whitelistEnabledNormal },
     ageQuery: { ...current.ageQuery, enabled: section.ageQueryEnabled },
+    enforcement: {
+      ...current.enforcement,
+      blocklist:
+        section.enforcementBlocklist === "allow" || section.enforcementBlocklist === "ask" || section.enforcementBlocklist === "deny"
+          ? section.enforcementBlocklist
+          : (current.enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist),
+    },
+    scoring: {
+      ...scoring,
+      cutoffYear: clampInt(section.scoringCutoffYear, scoring.cutoffYear, 2000, 2100),
+      tldTrustBonus: clampInt(section.scoringTldTrustBonus, scoring.tldTrustBonus, 0, 100),
+      patternBonus: clampInt(section.scoringPatternBonus, scoring.patternBonus, 0, 100),
+      postCutoffBonus: clampInt(section.scoringPostCutoffBonus, scoring.postCutoffBonus, 0, 100),
+      urlIpBonus: clampInt(section.scoringUrlIpBonus, scoring.urlIpBonus, 0, 100),
+      urlShortenerBonus: clampInt(section.scoringUrlShortenerBonus, scoring.urlShortenerBonus, 0, 100),
+      urlTrackingBonus: clampInt(section.scoringUrlTrackingBonus, scoring.urlTrackingBonus, 0, 100),
+    },
   };
 }
 
