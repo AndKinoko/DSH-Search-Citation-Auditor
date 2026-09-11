@@ -3,7 +3,9 @@ node_modules/
 
 # 构建产物（tsc 输出 + tsdown client bundle）
 lib/
+# 忽略本地打的包，但放行本仓库的正式发布包（随版本提交，便于直接安装）
 *.tgz
+!dsh-citation-auditor-*.tgz
 
 # npm 库不提交 lockfile（发布与 git 安装都不需要）
 package-lock.json
