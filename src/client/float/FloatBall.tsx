@@ -17,6 +17,7 @@ interface FloatBallProps {
     onPointerDown: (e: React.PointerEvent) => void;
     onPointerMove: (e: React.PointerEvent) => void;
     onPointerUp: (e: React.PointerEvent) => void;
+    onPointerCancel: (e: React.PointerEvent) => void;
   };
 }
 
@@ -35,6 +36,7 @@ export function FloatBall({ pos, nonTrusted, failed, hasVerdicts, dragHandlers }
       onPointerDown={dragHandlers.onPointerDown}
       onPointerMove={dragHandlers.onPointerMove}
       onPointerUp={dragHandlers.onPointerUp}
+      onPointerCancel={dragHandlers.onPointerCancel}
       style={{
         position: "fixed",
         right: pos.right,

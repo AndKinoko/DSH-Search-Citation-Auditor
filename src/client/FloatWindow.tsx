@@ -21,7 +21,7 @@
  * /api/citation-auditor/audit（与 citation_audit 工具、Phase 3 交互报表
  * 同一条管道），模式、名单、年龄缓存天然一致。
  */
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import type { Context } from "@deepseek-ai/cordis";
 import type { ISessions } from "@deepseek-ai/dsh-api-session-controller/client";
@@ -48,13 +48,36 @@ import {
   type ModalSpec,
   type FloatPos,
 } from "./float/index.js";
-import { clamp } from "./float/styles.js";
+import { clamp, fitBounds } from "./float/styles.js";
 
 const POS_KEY = "citation-auditor-float-pos";
 const OPEN_KEY = "citation-auditor-float-open";
 const DEFAULT_POS: FloatPos = { right: 24, bottom: 24 };
-/** 视口内边距与悬浮球占位（clamp 用的最小/最大余量）。 */
+/** 视口内边距（clamp 用的最小余量）。 */
 const MARGIN = 12;
+/** 展开面板的固定宽度与高度上限——拖拽钳位必须按它算，不能按悬浮球。 */
+const PANEL_W = 380;
+const PANEL_MAX_H = 0.6;
+/**
+ * 展开面板里**不允许**触发拖拽的元素：点它们要执行动作，而不是挪窗口。
+ *
+ * 只排交互控件，刻意不排 `a`：域名是 `<button>`（走 onOpenDomain），不是裸链接。
+ * 也没有把非交互文字区标成「可选区让开」——正文是域名列表、几乎全是按钮，硬让开
+ * 会让用户在按钮上点不动；更关键的是标题栏这类非交互区域**必须**能拖：用户第一
+ * 反应就是去拖标题栏，它一被排除就会表现为「全框可拖没生效 / 拖不动」。
+ */
+const NO_DRAG_SELECTOR = "button, input, select, textarea, [role='button'], [data-no-drag]";
+
+function tuple(b: { lo: number; hi: number }): [number, number] {
+  return [b.lo, b.hi];
+}
+
+/** 指针事件的合成路径上是否应当跳过拖拽。 */
+function shouldSkipDrag(target: EventTarget | null, el: Element): boolean {
+  if (!(target instanceof Element)) return false;
+  if (el.contains(target) === false) return false;
+  return target.closest(NO_DRAG_SELECTOR) !== null;
+}
 
 function loadPos(): FloatPos {
   try {
@@ -373,41 +396,72 @@ export function CitationAuditorFloatWindow(props: {
   const [pos, setPos] = useState<FloatPos>(loadPos);
   const [open, setOpen] = useState(loadOpen);
   const [settingsView, setSettingsView] = useState(false);
-  const dragRef = useRef<{ x: number; y: number; right: number; bottom: number; moved: boolean } | null>(null);
+  const dragRef = useRef<{ x: number; y: number; right: number; bottom: number; moved: boolean; pointerId: number } | null>(null);
+  // 最新位置的旁路引用：onPointerUp 要落盘的是「最后一帧」的位置，而闭包里的
+  // pos 取自渲染时——末次 setPos 与 pointerup 若落在同一批更新里就会存回旧值。
+  const posRef = useRef(pos);
+  posRef.current = pos;
+  // 面板实测尺寸：拖拽时要按**面板**的占位做钳位，不是按悬浮球，否则整个面板
+  // 会被拖出视口（球只有 44px，面板 380px）。量不到时退回到 CSS 的上限值。
+  const panelRef = useRef<HTMLDivElement | null>(null);
 
   const bindDrag = useCallback(
-    (onTap: () => void) => ({
-      onPointerDown: (e: React.PointerEvent): void => {
-        if (e.button !== 0) return;
-        if (e.target !== e.currentTarget && (e.target as HTMLElement).closest("button") !== null) return;
-        e.currentTarget.setPointerCapture(e.pointerId);
-        dragRef.current = { x: e.clientX, y: e.clientY, right: pos.right, bottom: pos.bottom, moved: false };
-      },
-      onPointerMove: (e: React.PointerEvent): void => {
-        const drag = dragRef.current;
-        if (drag === null) return;
-        const dx = e.clientX - drag.x;
-        const dy = e.clientY - drag.y;
-        if (!drag.moved && Math.max(Math.abs(dx), Math.abs(dy)) > 4) drag.moved = true;
-        if (!drag.moved) return;
-        setPos({
-          right: clamp(drag.right - dx, MARGIN, window.innerWidth - BALL_SIZE - MARGIN),
-          bottom: clamp(drag.bottom - dy, MARGIN, window.innerHeight - BALL_SIZE - MARGIN),
-        });
-      },
-      onPointerUp: (e: React.PointerEvent): void => {
+    (onTap: () => void, grip: () => { w: number; h: number }) => {
+      const finish = (e: React.PointerEvent, cancelled: boolean): void => {
         const drag = dragRef.current;
         dragRef.current = null;
-        e.currentTarget.releasePointerCapture(e.pointerId);
+        // 必须解捕获：否则元素一直抓着指针，后续 move 继续改位置，且 touch 场景
+        // 下按钮再也不会收到事件。
+        if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        }
         if (drag === null) return;
         if (drag.moved) {
-          savePos(pos);
-        } else {
+          savePos(posRef.current);
+        } else if (!cancelled) {
+          // 位移没超过阈值才算点击。被取消的 pointer（系统手势、浏览器接管、页面
+          // 失焦）不能当点击——否则用户点了却什么都没发生，看起来就是「卡住了」。
           onTap();
         }
-      },
-    }),
-    [pos],
+      };
+      return {
+        onPointerDown: (e: React.PointerEvent): void => {
+          if (e.button !== 0) return;
+          // 走合成事件路径：绑定在面板根元素上时，深层子元素的指针事件也会冒泡上来，
+          // 用 e.target 判定会漏掉。按 closest() 就近查，与监听位置无关。
+          if (shouldSkipDrag(e.nativeEvent.composedPath()[0] ?? e.target, e.currentTarget)) return;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          dragRef.current = {
+            x: e.clientX,
+            y: e.clientY,
+            right: posRef.current.right,
+            bottom: posRef.current.bottom,
+            moved: false,
+            pointerId: e.pointerId,
+          };
+        },
+        onPointerMove: (e: React.PointerEvent): void => {
+          const drag = dragRef.current;
+          if (drag === null || drag.pointerId !== e.pointerId) return;
+          const dx = e.clientX - drag.x;
+          const dy = e.clientY - drag.y;
+          if (!drag.moved && Math.max(Math.abs(dx), Math.abs(dy)) > 4) drag.moved = true;
+          if (!drag.moved) return;
+          const { w, h } = grip();
+          const rx = fitBounds(window.innerWidth, w, MARGIN);
+          const ry = fitBounds(window.innerHeight, h, MARGIN);
+          setPos({
+            right: clamp(drag.right - dx, rx.lo, rx.hi),
+            bottom: clamp(drag.bottom - dy, ry.lo, ry.hi),
+          });
+        },
+        onPointerUp: (e: React.PointerEvent): void => finish(e, false),
+        // 指针被系统取消时必须走同一套收尾，否则 dragRef 与 pointer capture 一起
+        // 残留：下一次点击会因 moved 仍为 true 而被当成拖拽，面板再也点不开。
+        onPointerCancel: (e: React.PointerEvent): void => finish(e, true),
+      };
+    },
+    [],
   );
 
   const toggleOpen = useCallback((v: boolean): void => {
@@ -419,8 +473,56 @@ export function CitationAuditorFloatWindow(props: {
     }
   }, []);
 
-  const ballDrag = useMemo(() => bindDrag(() => toggleOpen(true)), [bindDrag, toggleOpen]);
-  const headerDrag = useMemo(() => bindDrag(() => {}), [bindDrag]);
+  // 面板根元素是 position:fixed 且高度由内容决定（没有 flex:1 的拉伸父级），
+  // 所以 offsetHeight 就是真实尺寸——之前用带 flex:1 的 header 去量，量到的是
+  // 被压缩后的高度，钳位自然算不准。量不到时退回 CSS 的上限。
+  const panelGrip = useCallback((): { w: number; h: number } => {
+    const el = panelRef.current;
+    const raw = el && el.offsetHeight > 0 ? el.offsetHeight : window.innerHeight * PANEL_MAX_H;
+    return {
+      w: Math.min(PANEL_W, Math.max(1, window.innerWidth - 2 * MARGIN)),
+      h: Math.min(Math.max(1, raw), window.innerHeight * PANEL_MAX_H),
+    };
+  }, []);
+
+  /** 把当前 pos 收进「面板尺寸」允许的范围内。 */
+  const clampPosToPanel = useCallback((): FloatPos => {
+    const { w, h } = panelGrip();
+    return {
+      right: clamp(posRef.current.right, ...tuple(fitBounds(window.innerWidth, w, MARGIN))),
+      bottom: clamp(posRef.current.bottom, ...tuple(fitBounds(window.innerHeight, h, MARGIN))),
+    };
+  }, [panelGrip]);
+
+  /**
+   * 展开时先把位置收进可见范围。
+   *
+   * 这一步是必须的，拖拽钳位救不了它：球可以停在 x≈12（球自己的边界），而面板宽
+   * 380px，同一个 right 值会让面板左边缘落到视口外——面板一打开就在屏幕外，而它
+   * 的拖拽热区也在屏幕外，用户抓不到任何东西把它拖回来（这就是「卡住」）。
+   */
+  const openPanel = useCallback((): void => {
+    setOpen(true);
+    posRef.current = clampPosToPanel();
+    setPos(posRef.current);
+    savePos(posRef.current);
+  }, [clampPosToPanel]);
+
+  // 悬浮球按自身 44px 钳位；面板按实测尺寸钳位，两者共用同一个 pos，切换时不跳动。
+  const ballDrag = useMemo(() => bindDrag(openPanel, () => ({ w: BALL_SIZE, h: BALL_SIZE })), [bindDrag, openPanel]);
+  const headerDrag = useMemo(() => bindDrag(() => {}, panelGrip), [bindDrag, panelGrip]);
+
+  // 兜底：面板展开后若视口变小（窗口缩放 / 显示器切换），或 pos 来自损坏的
+  // 持久化数据，都在这里拉回可见范围。渲染后测量，避免首帧闪一下。
+  useLayoutEffect(() => {
+    if (!open) return;
+    const fixed = clampPosToPanel();
+    if (fixed.right !== posRef.current.right || fixed.bottom !== posRef.current.bottom) {
+      posRef.current = fixed;
+      setPos(fixed);
+      savePos(fixed);
+    }
+  }, [open, settingsView, audit, clampPosToPanel]);
 
   const verdicts = audit?.verdicts ?? [];
   const nonTrusted = verdicts.filter((v) => v.level !== "trusted").length;
@@ -439,12 +541,18 @@ export function CitationAuditorFloatWindow(props: {
         // 展开面板：标题栏拖拽；正文 = 设置视图 或 审计列表（含名单操作按钮）
         <div
           data-citation-auditor-panel
+          ref={panelRef}
+          // 整个面板都是拖拽热区：空白区、标题栏、列表空白处都能拖。
+          onPointerDown={headerDrag.onPointerDown}
+          onPointerMove={headerDrag.onPointerMove}
+          onPointerUp={headerDrag.onPointerUp}
+          onPointerCancel={headerDrag.onPointerCancel}
           style={{
             position: "fixed",
             right: pos.right,
             bottom: pos.bottom,
-            width: 380,
-            maxHeight: "60vh",
+            width: PANEL_W,
+            maxHeight: `${PANEL_MAX_H * 100}vh`,
             display: "flex",
             flexDirection: "column",
             background: "var(--bg-color, #1e1e1e)",
@@ -456,12 +564,18 @@ export function CitationAuditorFloatWindow(props: {
             fontSize: 13,
             zIndex: 2147483000,
             overflow: "hidden",
+            // 面板整体可拖；但正文要能选字，所以 user-select 保持 text，
+            // 拖拽热区由 shouldSkipDrag 的 SELECTABLE_SELECTOR 让开（选中优先）。
+            cursor: "default",
+            userSelect: "text",
+            // 触屏上默认会先滚动/放大，抢走指针序列，拖拽就断在半路。
+            touchAction: "none",
           }}
         >
           <div
-            onPointerDown={headerDrag.onPointerDown}
-            onPointerMove={headerDrag.onPointerMove}
-            onPointerUp={headerDrag.onPointerUp}
+            // 拖拽绑定在面板根元素上，整个框都是热区。标题栏**不能**标 data-no-drag：
+            // 它排除后，用户最自然会去拖的地方就成了死区，表现为「拖不动」。
+            // 标题栏里的按钮各自命中 NO_DRAG_SELECTOR，互不影响。
             style={{
               display: "flex",
               alignItems: "center",
