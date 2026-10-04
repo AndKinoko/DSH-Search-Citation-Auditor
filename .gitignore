@@ -3,9 +3,21 @@ node_modules/
 
 # 构建产物（tsc 输出 + tsdown client bundle）
 lib/
-# 忽略本地打的包，但放行本仓库的正式发布包（随版本提交，便于直接安装）
+
+# 内部文档：设计取舍与历史记录，不随仓库分发
+DOCS/
+
+# 本地打包产物与临时脚本
 *.tgz
-!dsh-citation-auditor-*.tgz
+old.mjs
+
+# 排查/构建用的临时目录与脚本（不应入库）
+# _compat/ 是为了绕开沙箱写不进既有 lib/ 而临时改道编译输出的目录；
+# _probe/ 是解析 app.asar 用的；.acl-recovery/ 是 ACL 诊断留下的报告。
+_compat/
+_probe/
+.acl-recovery/
+scripts/_tmp-*.mjs
 
 # npm 库不提交 lockfile（发布与 git 安装都不需要）
 package-lock.json

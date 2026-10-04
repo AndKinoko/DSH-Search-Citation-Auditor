@@ -23,10 +23,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
-import type { ClientContext, ISessions } from "@deepseek-ai/dsh-client-runtime/client";
+import type { Context } from "@deepseek-ai/cordis";
+import type { ISessions } from "@deepseek-ai/dsh-api-session-controller/client";
 import type { SessionId } from "@deepseek-ai/dsh-client-connection/client";
-// Type-only：拉 Context 合并（ctx.uiConversation 服务面），运行时零依赖
+// Type-only：拉 Context 合并（ctx.uiConversation 服务面、'chat' target 快照形状），运行时零依赖
 import type {} from "@deepseek-ai/dsh-client-ui-conversation/client";
+import type {} from "@deepseek-ai/dsh-client-ui-chat/client";
 import {
   isConversationSettled,
   settledAssistantText,
@@ -108,11 +110,18 @@ export function CitationAuditorFloatWindow(props: {
   const { sessions, uiConversation } = props;
 
   // 当前会话 id（列表快照；切会话/无会话都会推新快照）
+  //
+  // 0.2.0 变更：SessionListState 不再有 `current` —— 该服务注释明说「导航归视图
+  // 属主所有」，运行时快照确认为 { ids, byId, phase, projectionsBySession }。
+  // 悬浮窗挂在 document.body、位于会话树之外，拿不到 shell 下发的 scope prop，
+  // 只能退取列表首位（ids 是宿主列表顺序，通常最近会话在前）。
+  // 旧宿主若仍带 current 则优先用它，故这里按可选字段读取。
   const list = useSyncExternalStore(
     useMemo(() => sessions.list.subscribe.bind(sessions.list), [sessions]),
     useMemo(() => sessions.list.getSnapshot.bind(sessions.list), [sessions]),
-  );
-  const current: SessionId | undefined = list.current;
+  ) as { current?: SessionId; ids?: readonly SessionId[] } | undefined;
+  const current: SessionId | undefined =
+    list?.current ?? (Array.isArray(list?.ids) ? list.ids[0] : undefined);
   const binding = useMemo(
     () => (current !== undefined ? sessions.binding(current) : undefined),
     [sessions, current],
@@ -562,7 +571,7 @@ export function CitationAuditorFloatWindow(props: {
  * 保证页面上只有一个容器。返回卸载函数（当前 apply 不注册卸载，
  * 靠这里的单实例接管保证热重载不叠窗）。
  */
-export function mountFloatWindow(ctx: ClientContext): () => void {
+export function mountFloatWindow(ctx: Context): () => void {
   if (typeof document === "undefined") return () => {};
   for (const stale of Array.from(document.querySelectorAll("div[data-citation-auditor-float]"))) {
     stale.remove();

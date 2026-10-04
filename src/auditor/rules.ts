@@ -6,8 +6,10 @@
  * 首次运行写入预写内容（whitelist 预写 wikipedia.org 等权威域名，blocklist 预写 .xyz/.top）。
  * 升级永不覆盖；开关与记录解耦。
  */
-import type { ListEntry, Settings, ScoringParams } from "./types.js";
+import type { EnforcementAction, ListEntry, Settings, ScoringParams } from "./types.js";
 import { DEFAULT_SETTINGS, DEFAULT_SCORING, DEFAULT_ENFORCEMENT } from "./types.js";
+import type { InjectionSettings } from "./injection/types.js";
+import { DEFAULT_INJECTION } from "./injection/types.js";
 import type { KeyValueStore } from "../storage.js";
 import { parse as pslParse } from "psl";
 
@@ -24,6 +26,69 @@ const PREWRITE_BLOCK: ListEntry[] = [
   { domain: ".xyz", reason: "预写：垃圾 TLD", date: "2024-01-01T00:00:00Z" },
   { domain: ".top", reason: "预写：垃圾 TLD", date: "2024-01-01T00:00:00Z" },
 ];
+
+const MODES = ["whitelist", "normal", "simple"] as const;
+const ENFORCEMENT_ACTIONS = ["allow", "ask", "deny"] as const;
+
+function isModeValue(v: unknown): v is Settings["mode"] {
+  return typeof v === "string" && (MODES as readonly string[]).includes(v);
+}
+
+function isEnforcementAction(v: unknown): v is EnforcementAction {
+  return typeof v === "string" && (ENFORCEMENT_ACTIONS as readonly string[]).includes(v);
+}
+
+/**
+ * 评分权重逐键校验。
+ *
+ * settings.json 由用户手改，任何一个 ScoringParams 键是非数值都会出事：
+ * `score += "abc"` 让 score 变成字符串，Math.min/max 再产出 NaN，而
+ * levelFromScore 的三个比较对 NaN 全为 false → **返回 "trusted"**（fail-open，
+ * 高风险域名被判可信）；`25 + "50"` 则虚高到 100（误报）。JSON.stringify(NaN)
+ * 还是 null，违反工具声明的 score: {type:"integer"}。
+ * 不合规键一律回落默认值，其余保留。
+ */
+function sanitizeScoring(input: Partial<ScoringParams>): ScoringParams {
+  const out: ScoringParams = { ...DEFAULT_SCORING };
+  for (const key of Object.keys(DEFAULT_SCORING) as (keyof ScoringParams)[]) {
+    const v = input[key];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      (out as Record<string, number>)[key] = v;
+    }
+  }
+  return out;
+}
+
+/** 注入设置逐键校验：scanMaxBytes / fuzzyThreshold 等数值必须有限且为正。 */
+function sanitizeInjection(input: Partial<InjectionSettings> | undefined): InjectionSettings {
+  const out: InjectionSettings = { ...DEFAULT_INJECTION };
+  if (!input || typeof input !== "object") return out;
+  if (typeof input.enabled === "boolean") out.enabled = input.enabled;
+  if (typeof input.fuzzy === "boolean") out.fuzzy = input.fuzzy;
+  if (typeof input.fuzzyThreshold === "number" && Number.isFinite(input.fuzzyThreshold)) {
+    out.fuzzyThreshold = Math.min(2, Math.max(1, Math.round(input.fuzzyThreshold)));
+  }
+  if (typeof input.scanMaxBytes === "number" && Number.isFinite(input.scanMaxBytes)) {
+    out.scanMaxBytes = Math.min(8 * 1024 * 1024, Math.max(4096, Math.round(input.scanMaxBytes)));
+  }
+  return out;
+}
+
+/**
+ * 完整默认设置。注入字段必须**显式**给出：DEFAULT_SETTINGS 里它是可选的，
+ * 早前的 catch 分支直接展开 DEFAULT_SETTINGS，于是读到的 settings.injection 是
+ * undefined，消费方退化成 {} 并整体旁路检测，而界面却仍显示"已启用"。
+ * 每个嵌套字段都浅拷贝，避免调用方就地改到模块常量。
+ */
+function defaultSettings(): Settings {
+  return {
+    ...DEFAULT_SETTINGS,
+    blocklistEnabled: { ...DEFAULT_SETTINGS.blocklistEnabled },
+    whitelistEnabled: { ...DEFAULT_SETTINGS.whitelistEnabled },
+    ageQuery: { ...DEFAULT_SETTINGS.ageQuery },
+    injection: { ...DEFAULT_INJECTION },
+  };
+}
 
 export class RuleStore {
   constructor(private readonly storage: KeyValueStore) {}
@@ -43,7 +108,7 @@ export class RuleStore {
 
   getSettings(): Settings {
     const raw = this.storage.getItem(K_SETTINGS);
-    if (!raw) return { ...DEFAULT_SETTINGS };
+    if (!raw) return defaultSettings();
     try {
       const parsed = JSON.parse(raw) as Partial<Settings>;
       return {
@@ -54,11 +119,23 @@ export class RuleStore {
         whitelistEnabled: { ...DEFAULT_SETTINGS.whitelistEnabled, ...(parsed.whitelistEnabled ?? {}) },
         ageQuery: { ...DEFAULT_SETTINGS.ageQuery, ...(parsed.ageQuery ?? {}) },
         onFailure: parsed.onFailure === "treatAsNew" ? "treatAsNew" : DEFAULT_SETTINGS.onFailure,
-        scoring: parsed.scoring ? { ...DEFAULT_SCORING, ...parsed.scoring } : undefined,
-        enforcement: parsed.enforcement ? { ...DEFAULT_ENFORCEMENT, ...parsed.enforcement } : undefined,
+        // mode / enforcement 逐值校验：settings.json 是给人手改的，一个笔误（"nomral"）
+        // 会让 blocklistEnabled[mode] 变 undefined、classify 的 switch 落到无分支处
+        // 返回 undefined，再被 service 赋值时抛 TypeError，整个 citation_audit 挂掉。
+        mode: isModeValue(parsed.mode) ? parsed.mode : DEFAULT_SETTINGS.mode,
+        scoring: parsed.scoring ? sanitizeScoring(parsed.scoring) : undefined,
+        enforcement: parsed.enforcement
+          ? { blocklist: isEnforcementAction(parsed.enforcement.blocklist) ? parsed.enforcement.blocklist : DEFAULT_ENFORCEMENT.blocklist }
+          : undefined,
+        injection: sanitizeInjection(parsed.injection),
       };
     } catch {
-      return { ...DEFAULT_SETTINGS };
+      // 解析失败也必须走同一个构造器：早前这里直接返回裸 DEFAULT_SETTINGS，而它
+      // **没有 injection 键**（该字段可选）。于是注入防护读到 {} → enabled!==true →
+      // 整体旁路，而 status.injectionEnabled 用 (s.injection ?? DEFAULT_INJECTION)
+      // 仍然报 true —— 防护静默关闭、界面说谎。fail-open 且报告相反事实，比没有
+      // 控制更糟。
+      return defaultSettings();
     }
   }
 
@@ -121,11 +198,21 @@ export class RuleStore {
   /** 用已解析的名单集合判定（service 循环内复用，避免重复读盘）。 */
   blocksWith(sets: { domains: Set<string>; tlds: Set<string> }, domain: string): boolean {
     if (sets.domains.has(domain)) return true;
-    const tld = pslParse(domain).tld;
-    if (!tld) return false;
+    // 点号条目要分两类，否则一大类用户输入会变成**永远匹配不到的死条目**：
+    //   - 纯 TLD（".xyz"）→ 与公共后缀比对，原有语义；
+    //   - ".evil.com" 这种「域 + 其子域」写法（hosts 文件 / adblock / uBlock 的标准
+    //     语法）→ 必须与**完整主机**比对。此前它只被拿去和 tld 比，而
+    //     pslParse("a.evil.com").tld === "com"，于是永远不等于，拦不到任何东西，
+    //     而 addToList 照收不误、工具还回报"已加入"。
     for (const entry of sets.tlds) {
       const suffix = entry.replace(/^\./, "").toLowerCase();
-      if (suffix !== "" && (tld === suffix || tld.endsWith(`.${suffix}`))) return true;
+      if (suffix === "") continue;
+      if (suffix.includes(".")) {
+        if (domain === suffix || domain.endsWith(`.${suffix}`)) return true;
+        continue;
+      }
+      const tld = pslParse(domain).tld;
+      if (tld && (tld === suffix || tld.endsWith(`.${suffix}`))) return true;
     }
     return false;
   }
@@ -135,7 +222,19 @@ export class RuleStore {
     if (!raw) return [];
     try {
       const arr = JSON.parse(raw) as ListEntry[];
-      return Array.isArray(arr) ? arr.filter((e) => e && typeof e.domain === "string") : [];
+      if (!Array.isArray(arr)) return [];
+      // 归一化：手改名单文件时留下的大小写/空白差异会让条目**永不匹配**，而且
+      // removeFromList 按精确串删不掉——用户只能继续手工编辑文件才能移除。
+      const out: ListEntry[] = [];
+      const seen = new Set<string>();
+      for (const e of arr) {
+        if (!e || typeof e.domain !== "string") continue;
+        const domain = e.domain.trim().toLowerCase();
+        if (domain === "" || seen.has(domain)) continue;
+        seen.add(domain);
+        out.push(domain === e.domain ? e : { ...e, domain });
+      }
+      return out;
     } catch {
       return [];
     }

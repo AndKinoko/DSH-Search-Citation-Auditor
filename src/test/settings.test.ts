@@ -14,6 +14,7 @@ import { AgeQueryFile } from "../auditor/ageQueryFile.js";
 import { DEFAULT_SETTINGS, type Settings } from "../auditor/types.js";
 import { DirectoryStore } from "../storage.js";
 import { DEFAULT_ENFORCEMENT, DEFAULT_SCORING } from "../auditor/types.js";
+import { DEFAULT_INJECTION } from "../auditor/injection/types.js";
 import {
   makeSectionSchema,
   sectionToSettings,
@@ -89,6 +90,10 @@ test("settings ↔ section 双向映射：开关各就各位，ageQuery.code 不
     scoringUrlIpBonus: DEFAULT_SCORING.urlIpBonus,
     scoringUrlShortenerBonus: DEFAULT_SCORING.urlShortenerBonus,
     scoringUrlTrackingBonus: DEFAULT_SCORING.urlTrackingBonus,
+    injectionEnabled: DEFAULT_INJECTION.enabled,
+    injectionFuzzy: DEFAULT_INJECTION.fuzzy,
+    injectionFuzzyThreshold: DEFAULT_INJECTION.fuzzyThreshold,
+    injectionScanMaxBytes: DEFAULT_INJECTION.scanMaxBytes,
   });
   const back = sectionToSettings(section, custom);
   assert.equal(back.enabled, false);
@@ -98,6 +103,23 @@ test("settings ↔ section 双向映射：开关各就各位，ageQuery.code 不
   assert.deepEqual(back.ageQuery, { code: "/* 保留 */", enabled: true });
   assert.equal(back.onFailure, "treatAsNew");
   assert.equal(back.enforcement?.blocklist, DEFAULT_ENFORCEMENT.blocklist);
+  // 注入设置往返后应回到默认（typo 模糊匹配默认关，这点不能被静默改掉）
+  assert.equal(back.injection?.enabled, DEFAULT_INJECTION.enabled);
+  assert.equal(back.injection?.fuzzy, DEFAULT_INJECTION.fuzzy);
+  assert.equal(back.injection?.fuzzyThreshold, DEFAULT_INJECTION.fuzzyThreshold);
+});
+
+test("注入设置：开关经 section 往返保真，模糊匹配可被显式打开", () => {
+  const custom: Settings = { ...DEFAULT_SETTINGS, injection: { ...DEFAULT_INJECTION, enabled: false, fuzzy: true } };
+  const section = settingsToSection(custom);
+  assert.equal(section.injectionEnabled, false);
+  assert.equal(section.injectionFuzzy, true);
+  const back = sectionToSettings(section, custom);
+  assert.equal(back.injection?.enabled, false);
+  assert.equal(back.injection?.fuzzy, true);
+  // 阈值越界应被 clamp 而不是原样落盘
+  const clamped = sectionToSettings({ ...section, injectionFuzzyThreshold: 99 }, custom);
+  assert.equal(clamped.injection?.fuzzyThreshold, 2);
 });
 
 test("buildStatusPayload：文件路径、名单数量、设置快照", () => {

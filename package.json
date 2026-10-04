@@ -1,6 +1,6 @@
 {
   "name": "dsh-citation-auditor",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "Citation Auditor — 审查 AI 回复里的引用来源：扫描、评分、出报表，拦截策略可配",
   "license": "MIT",
   "private": false,
@@ -17,25 +17,25 @@
   },
   "files": [
     "lib",
+    "!lib/**/*.map",
+    "!lib/test",
+    "!lib/types/test",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.2"
   },
   "dsh": {
-    "engines": {
-      "dsh": ">=0.1.1-rc.1"
-    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-tool",
         "@deepseek-ai/dsh-client-ui-conversation"
       ],
       "platform": "web"
@@ -45,7 +45,7 @@
     "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json && tsdown",
-    "test": "npm run build && node --test lib/test/core.test.js lib/test/settings.test.js lib/test/float.test.js lib/test/webBlock.test.js",
+    "test": "npm run build && node --test lib/test/core.test.js lib/test/settings.test.js lib/test/float.test.js lib/test/webBlock.test.js lib/test/injection.test.js lib/test/routeGuard.test.js lib/test/security.test.js",
     "verify": "node scripts/verify-plugin.mjs .",
     "verify:pack": "node scripts/verify-plugin.mjs . --pack",
     "pack": "npm pack --dry-run"
@@ -54,10 +54,12 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-settings": ">=0.1.1-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-host-webserver": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-settings": {
@@ -65,17 +67,29 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-client-connection": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-runtime": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-conversation": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-tool": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-host-webserver": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.2",
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-api-session-controller": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-connection": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-chat": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-tool": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-invariants": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-ptc-runtime": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-scope": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-user-approval": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^22.20.1",
     "@types/react": "~18.3.12",
     "@types/react-dom": "~18.3.1",

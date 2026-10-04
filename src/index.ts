@@ -17,18 +17,17 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import Schema from "@deepseek-ai/schemastery";
 import type { Context } from "@deepseek-ai/cordis";
-import { defineTool, type PreToolDecision, type ToolExecution } from "@deepseek-ai/dsh-tools";
+import type { ContentBlock } from "@deepseek-ai/dsh-llm";
+import { defineTool, type PreToolDecision, type ToolExecution, type PostToolDecision } from "@deepseek-ai/dsh-tools";
 import { Auditor } from "./auditor/service.js";
 import { testAgeQuery } from "./auditor/ageQuery.js";
 import { AgeQueryFile } from "./auditor/ageQueryFile.js";
 import type { Mode } from "./auditor/types.js";
 import { DirectoryStore, migrateLegacyState } from "./storage.js";
 import { blockedToolDecision } from "./webBlock.js";
-import {
-  installSettingsCard,
-  sectionToSettings,
-  settingsToSection,
-} from "./settingsSection.js";
+import { guardFetchContent } from "./injectionBlock.js";
+import { DEFAULT_INJECTION } from "./auditor/injection/types.js";
+import { installSettingsCard } from "./settingsSection.js";
 import { makeCitationRoutes } from "./routes.js";
 
 /** Cordis 插件标识：非 scope 包名，必须等于 package.json 的 name（规范 §2.1.7）。 */
@@ -140,14 +139,15 @@ export function apply(ctx: Context, config: AuditorConfig): void {
     name: "citation_manage",
     description:
       "管理引用审计器：查看状态、启用/休眠插件、切换模式（whitelist/normal/simple）、增删白名单与拦截名单、" +
-      "切换拦截策略（allow=仅提醒/ask=需确认/deny=直接拦截）、测试年龄查询片段。所有名单数据落盘且归用户所有。",
+      "切换拦截策略（allow=仅提醒/ask=需确认/deny=直接拦截）、开关网页注入防护、测试年龄查询片段。" +
+      "所有名单数据落盘且归用户所有。",
     parameters: {
       op: {
         type: "string",
         required: true,
-        enum: ["status", "enabled", "mode", "block", "whitelist", "remove", "policy", "testAgeQuery"],
+        enum: ["status", "enabled", "mode", "block", "whitelist", "remove", "policy", "injection", "testAgeQuery"],
         description:
-          "status=查看状态；enabled=启用/休眠插件；mode=切换模式；block=加入拦截名单；whitelist=加入白名单；remove=从名单移除；policy=切换拦截策略；testAgeQuery=用 wikipedia.org 测试年龄片段",
+          "status=查看状态；enabled=启用/休眠插件；mode=切换模式；block=加入拦截名单；whitelist=加入白名单；remove=从名单移除；policy=切换拦截策略；injection=开关网页注入防护；testAgeQuery=用 wikipedia.org 测试年龄片段",
       },
       value: { type: "boolean", description: "op=enabled 时的目标状态（true=启用，false=休眠）" },
       mode: { type: "string", enum: ["whitelist", "normal", "simple"], description: "op=mode 时的目标模式" },
@@ -177,7 +177,8 @@ export function apply(ctx: Context, config: AuditorConfig): void {
               `拦截名单开关(当前模式): ${s.blocklistEnabled ? "开" : "关"}\n` +
               `拦截策略: ${policyLabel}(${s.enforcement})\n` +
               `白名单: ${s.whitelistCount} 条\n拦截名单: ${s.blocklistCount} 条\n` +
-              `年龄查询: ${s.ageQueryEnabled ? "启用" : "停用"}`,
+              `年龄查询: ${s.ageQueryEnabled ? "启用" : "停用"}\n` +
+              `网页注入防护: ${s.injectionEnabled ? "启用（仅提示）" : "关闭"}`,
           };
         }
         case "enabled": {
@@ -216,6 +217,26 @@ export function apply(ctx: Context, config: AuditorConfig): void {
           auditor.rules.saveSettings({ ...s, enforcement: { ...s.enforcement, blocklist: args.action } });
           return { result: `拦截策略已切换: ${args.action}` };
         }
+        case "injection": {
+          const s = auditor.getSettings();
+          const cur = s.injection ?? DEFAULT_INJECTION;
+          if (typeof args.value === "boolean") {
+            auditor.rules.saveSettings({ ...s, injection: { ...cur, enabled: args.value } });
+            return {
+              result: args.value
+                ? "网页注入防护已启用（web_fetch 正文命中注入时在正文前插入警示块，正文不改）"
+                : "网页注入防护已关闭（web_fetch 正文不再检测）",
+            };
+          }
+          const f = cur.fuzzy === true;
+          return {
+            result:
+              `网页注入防护: ${cur.enabled ? "启用（仅提示）" : "关闭"}\n` +
+              `typo 模糊匹配: ${f ? "开" : "关（默认）"}\n` +
+              `扫描上限: ${cur.scanMaxBytes} 字节\n` +
+              "用法: op=injection + value=true/false 开关防护",
+          };
+        }
         case "testAgeQuery": {
           const code = auditor.getAgeQueryCode(); // 实时读 ageQuery.js
           const r = await testAgeQuery(code);
@@ -236,28 +257,107 @@ export function apply(ctx: Context, config: AuditorConfig): void {
   // 真实拦截：tools/pre-execute 阶段检查 web 工具（web_search / web_fetch 等）
   // 参数里的域名，命中拦截名单即按策略处置（deny=直接拦截，ask=需确认，allow=仅提醒放行）。
   ctx.on("tools/pre-execute", async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
-    if (!auditor.getSettings().enabled) return next(); // 插件休眠时不拦
-    const decision = blockedToolDecision(auditor, exec.name, exec.arguments);
-    return decision ?? next();
+    try {
+      if (!auditor.getSettings().enabled) return next(); // 插件休眠时不拦
+      const decision = blockedToolDecision(auditor, exec.name, exec.arguments);
+      return decision ?? next();
+    } catch (err) {
+      // 拦截器自身出错绝不能升级成"拒绝调用"：那是替用户做决定，且故障表现会伪装成
+      // 策略生效。降级为放行并留痕。
+      logWarn(ctx, `citation-auditor: pre-execute 检查异常，已放行 — ${errText(err)}`);
+      return next();
+    }
   });
 
-  // 设置命名空间的 host 兼容注册：settings 服务存在时注册，写入经 onChange 回写
-  // settings.json。client 各界面现已统一走自有 /settings 端点，此注册仅作设置页
-  // 命名空间的兼容面；没有 settings 服务的宿主自动跳过。
-  installSettingsCard(ctx, settingsToSection(auditor.getSettings()), (section) => {
-    auditor.rules.saveSettings(sectionToSettings(section, auditor.getSettings()));
-  });
+  // 响应侧注入防护：tools/post-execute 阶段检查 web_fetch 返回的正文，命中注入
+  // 时只在正文**前面插入**一段警示块（正文一字不改），由用户自行判断是否中断。
+  // 插件总开关关闭时整体旁路。
+  ctx.on(
+    "tools/post-execute",
+    async (
+      exec: ToolExecution,
+      result: { isError: boolean; content: ContentBlock[] },
+      next: () => Promise<PostToolDecision>,
+    ): Promise<PostToolDecision> => {
+      // 插件休眠不处理；工具失败时的 content 是渲染好的错误文案，没有注入面
+      if (!auditor.getSettings().enabled || result.isError) return next();
+      // dsh-tools 把本监听器包在 execute 的外层 try/catch 里（"a throwing listener
+      // → isError"），所以这里的任何抛出都会把整个 web_fetch 结果变成工具错误，
+      // 用户拿到的是报错而不是页面。防御性扫描器只能降级成"没有告警"。
+      try {
+        // 先把链条跑完再替换内容。cordis 明确规定「不调用 next() 的监听器会否决整条
+        // 链，包括内建行为」（events.d.ts:160-162）；原实现在命中路径直接 return，
+        // 于是恰恰在最需要告警的那条对抗性内容路径上，宿主里其它所有 post-execute
+        // 监听器都被跳过——纯顺序依赖，谁先注册谁说了算。
+        const downstream = await next();
+        if (downstream.kind !== "accept") return downstream; // 下游已否决，勿覆盖
+        const upstream = downstream.content ?? result.content;
+        const guarded = guardFetchContent(auditor, exec.name, exec.arguments, upstream);
+        if (!guarded.changed) return downstream;
+        return { kind: "accept", content: guarded.content };
+      } catch (err) {
+        logWarn(ctx, `citation-auditor: 注入检测异常，本次不加告警 — ${errText(err)}`);
+        return next();
+      }
+    },
+  );
+
+  // 设置命名空间的 host 注册：settings 服务存在时登记存在性（auto:false，因本插件
+  // 自带设置页）。client 各界面统一走自有 /settings 端点落盘 settings.json，
+  // SettingsForms 不接管数据真源，故这里无需回写回调。
+  installSettingsCard(ctx);
 
   // client 卡片的数据端点（status / test-age / open-file）。webServer 是可选
   // 服务：纯 CLI 宿主没有它，插件其余功能不受影响。
   ctx.inject(["webServer"], (wctx) => {
     wctx.effect(() => {
-      const disposers = makeCitationRoutes(auditor, dir).map((route) => wctx.webServer.register(route));
+      // 逐条注册并保留已成功的 disposer：WebServer.register 对重复 (kind,path)
+      // 会抛错，原来的 .map 一旦中途抛出，前面 1..n-1 条已注册的路由既没有
+      // disposer 也已经挂在 webServer 上，插件卸载后仍然响应并对着一个已死的
+      // Auditor 服务请求。
+      const routes = makeCitationRoutes(auditor, dir);
+      const disposers: (() => void)[] = [];
+      try {
+        for (const route of routes) disposers.push(wctx.webServer.register(route));
+      } catch (err) {
+        for (const dispose of disposers.reverse()) {
+          try {
+            dispose();
+          } catch {
+            /* 单条回滚失败不应阻断其余回滚 */
+          }
+        }
+        throw err;
+      }
       return () => {
-        for (const dispose of disposers) dispose();
+        for (const dispose of disposers.reverse()) {
+          try {
+            dispose();
+          } catch {
+            /* 卸载期尽力而为 */
+          }
+        }
       };
     }, "webServer.register citation-auditor routes");
   });
+}
+
+/** 统一的可诊断告警出口：cordis 的 logger 不在必需上下文里，拿不到就退回 stderr。 */
+function logWarn(ctx: unknown, message: string): void {
+  const logger = (ctx as { logger?: { warn?: (m: string) => void } })?.logger;
+  if (typeof logger?.warn === "function") {
+    logger.warn(message);
+    return;
+  }
+  try {
+    console.warn(message);
+  } catch {
+    /* 日志本身失败不应影响调用方 */
+  }
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function isMode(v: unknown): v is Mode {

@@ -70,9 +70,15 @@ const link: React.CSSProperties = {
 const dim: React.CSSProperties = { color: "gray" };
 
 /** 从工具入参还原审计文本；解析失败返回 undefined（退化为纯报表展示）。 */
-function textFromBlock(block: AuditRowProps["block"]): string | undefined {
-  const settled = "kind" in block;
-  const argsRaw = (settled ? block.call?.argsRaw : block.argsRaw) ?? "";
+function textFromProps(props: AuditRowProps): string | undefined {
+  // 0.2.0 起执行阶段由顶层 phase 判别式给出，block 是阶段专属节点：
+  //   preparing 尚未派发参数（没有 args）；start 是 StartedToolCall.argsRaw；
+  //   result 是 ToolResultNode.call?.argsRaw，且 call 在窗口截断时可为 null。
+  const { phase, block } = props;
+  let argsRaw = "";
+  if (phase === "start") argsRaw = block.argsRaw ?? "";
+  else if (phase === "result") argsRaw = block.call?.argsRaw ?? "";
+  if (argsRaw === "") return undefined;
   try {
     const parsed = JSON.parse(argsRaw) as unknown;
     if (typeof parsed === "object" && parsed !== null && typeof (parsed as Record<string, unknown>).text === "string") {
@@ -84,21 +90,20 @@ function textFromBlock(block: AuditRowProps["block"]): string | undefined {
   return undefined;
 }
 
-/** 已落盘的纯文本报表（block.content 的 text 块），兜底与"原始报表"展开用。 */
-function reportTextFromBlock(block: AuditRowProps["block"]): string | null {
-  if (!("kind" in block)) return null;
+/** 已落盘的纯文本报表（result 阶段 block.content 的 text 块），兜底与"原始报表"展开用。 */
+function reportTextFromProps(props: AuditRowProps): string | null {
+  if (props.phase !== "result") return null;
   const parts: string[] = [];
-  for (const item of block.content) {
+  for (const item of props.block.content) {
     if (item.type === "text") parts.push(item.text);
   }
   return parts.join("\n") || null;
 }
 
 export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
-  const { block } = props;
-  const settled = "kind" in block;
-  const isError = settled && block.isError;
-  const reportText = reportTextFromBlock(block);
+  const settled = props.phase === "result";
+  const isError = settled && props.block.isError;
+  const reportText = reportTextFromProps(props);
   const [audit, setAudit] = useState<AuditData | undefined>(undefined);
   const [failed, setFailed] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -107,7 +112,7 @@ export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
   const [rawOpen, setRawOpen] = useState(false);
   const [suppressedModes, setSuppressedModes] = useState<ReadonlySet<string>>(new Set());
 
-  const text = textFromBlock(block);
+  const text = textFromProps(props);
 
   const refresh = useCallback((): void => {
     if (text === undefined) return;

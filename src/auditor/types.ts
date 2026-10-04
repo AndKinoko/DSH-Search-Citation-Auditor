@@ -1,5 +1,7 @@
 /** Citation Auditor 领域类型。 */
 
+import type { InjectionSettings } from "./injection/types.js";
+
 export type Mode = "whitelist" | "normal" | "simple";
 
 export type Level = "trusted" | "suspicious" | "warning" | "critical";
@@ -57,6 +59,12 @@ export interface Settings {
   scoring?: ScoringParams;
   /** 处置策略（可选，不设置则用默认值：拦截名单命中直接拦截）。 */
   enforcement?: EnforcementPolicy;
+  /**
+   * 网页内容注入防护设置（可选，不设置则用 DEFAULT_INJECTION）。
+   * 与 enforcement 平行而非替代：enforcement 管域名拦截名单（请求侧），
+   * injection 管 web_fetch 响应正文的注入检测（响应侧）。
+   */
+  injection?: InjectionSettings;
 }
 
 /** 处置动作：allow=仅提醒（放行，只在报表标红），ask=需确认，deny=直接拦截。 */
@@ -151,7 +159,14 @@ export const LEVEL_LABEL: Record<Level, string> = {
   critical: "🔴 高危",
 };
 
-/** 只承载检测结果：任何"自动改写/拦截"都不允许。 */
+/**
+ * 只承载**审计**的检测结果：任何"自动改写/拦截"都不允许。
+ *
+ * 适用范围限定（本条注释在 v0.4 收窄）：指域名信誉审计链（scanner/scorer/
+ * report）不得改写输入文本，也不参与拦截决策。响应侧的注入检测是独立的一条链
+ * （auditor/injection/ + injectionBlock.ts），它只在 web_fetch 的工具结果
+ * 边界上、且仅在正文**前面插入**警示块，不删改任何原文内容。
+ */
 export interface ScanResult {
   urls: string[];
   domains: string[];

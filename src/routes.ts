@@ -3,6 +3,11 @@
  * dsh-pet 的 /api/pet/*（webServer 只供 client bundle，RPC 域平台注册，
  * 插件自备 API 是标准做法）。webserver 默认只听 loopback。
  *
+ * 安全（§3.3.1 / §3.3.4）：全部路由经 guardRoute 包装，先做回环 + Host +
+ * Origin/Sec-Fetch-Site 校验再进入 handler——webserver 自身不提供鉴权与来源
+ * 策略，这道校验只能插件自己做；只读端点无例外。响应一律 no-store，
+ * 错误只回固定 code，不透传内部细节。
+ *
  * 端点：
  *  - GET  status     设置快照 + 名单数量 + 各文件绝对路径
  *  - POST test-age   固定用 wikipedia.org 跑一次 ageQuery.js（设卡片的 [测试 ▸]）
@@ -20,6 +25,7 @@ import type { Auditor } from "./auditor/service.js";
 import { testAgeQuery } from "./auditor/ageQuery.js";
 import { DEFAULT_ENFORCEMENT } from "./auditor/types.js";
 import { settingsToSection, sectionToSettings, type CitationSettingsSection } from "./settingsSection.js";
+import { guardRoute } from "./routeGuard.js";
 
 /** 浏览器侧 API 基路径。 */
 export const API_PREFIX = "/api/citation-auditor";
@@ -35,7 +41,10 @@ export const OPENABLE_FILES = {
 export type OpenableFile = keyof typeof OPENABLE_FILES;
 
 export function isOpenableFile(v: unknown): v is OpenableFile {
-  return typeof v === "string" && v in OPENABLE_FILES;
+  // 必须用 hasOwn：`in` 会走原型链，plain object 字面量上 "toString" / "valueOf" /
+  // "constructor" / "__proto__" 全都返回 true，取出来是函数或对象，path.join 随即
+  // 抛 TypeError，而该抛错发生在 .then 的成功回调里 → 宿主回一个无 body 的裸 400。
+  return typeof v === "string" && Object.hasOwn(OPENABLE_FILES, v);
 }
 
 /** 跨平台"用默认程序打开文件"的命令（导出以便测试）。 */
@@ -50,7 +59,7 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": String(body.byteLength),
-    "cache-control": "no-cache",
+    "cache-control": "no-store",
   });
   res.end(body);
 }
@@ -240,9 +249,29 @@ export function makeCitationRoutes(
         const { cmd, args } = openCommandFor(path, process.platform);
         try {
           // detached + ignore：只负责唤起默认程序，不等它退出也不接它的输出
+          //
+          // spawn 的失败几乎全是**异步**上报的：调用本身正常返回，下一拍才 emit
+          // 'error'。不挂监听器的话 EventEmitter 视其为未捕获异常直接抛出，会带走
+          // **整个宿主进程**（Linux 上没装 xdg-utils 的机器点一次「查看/编辑」即崩）。
+          // 所以外层 try/catch 形同虚设，失败必须由这里的监听器兜住；成功也改到
+          // 'spawn' 事件上才回执，免得先报 ok 再发现没起来。
           const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
-          child.unref();
-          writeJson(res, 200, { ok: true, path, file });
+          let settled = false;
+          const respond = (status: number, payload: Record<string, unknown>): void => {
+            if (settled) return;
+            settled = true;
+            if (!res.headersSent) writeJson(res, status, payload);
+          };
+          child.once("error", (err: NodeJS.ErrnoException) => {
+            respond(500, {
+              ok: false,
+              error: err.code === "ENOENT" ? `系统里找不到「${cmd}」，无法打开该文件` : `打开文件失败：${err.message}`,
+            });
+          });
+          child.once("spawn", () => {
+            child.unref();
+            respond(200, { ok: true, path, file });
+          });
         } catch (error) {
           writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
         }
@@ -330,11 +359,13 @@ export function makeCitationRoutes(
           const BOOL_FIELDS: ReadonlyArray<keyof CitationSettingsSection> = [
             "enabled", "blocklistEnabledWhitelist", "blocklistEnabledNormal",
             "blocklistEnabledSimple", "whitelistEnabledNormal", "ageQueryEnabled",
+            "injectionEnabled", "injectionFuzzy",
           ];
           const NUM_FIELDS: ReadonlyArray<keyof CitationSettingsSection> = [
             "scoringCutoffYear", "scoringTldTrustBonus", "scoringPatternBonus",
             "scoringPostCutoffBonus", "scoringUrlIpBonus", "scoringUrlShortenerBonus",
             "scoringUrlTrackingBonus",
+            "injectionFuzzyThreshold", "injectionScanMaxBytes",
           ];
           const clean: Record<string, unknown> = {};
           for (const field of BOOL_FIELDS) {
@@ -365,5 +396,6 @@ export function makeCitationRoutes(
     },
   };
 
-  return [statusRoute, testAgeRoute, openFileRoute, auditRoute, listRoute, settingsRoute];
+  // 全部端点统一过来源校验（§3.3.1：只读路由无例外）
+  return [statusRoute, testAgeRoute, openFileRoute, auditRoute, listRoute, settingsRoute].map(guardRoute);
 }

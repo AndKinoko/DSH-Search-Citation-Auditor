@@ -376,6 +376,36 @@ export function CitationSettingsCard(_props: CardInject): React.ReactElement {
         );
       })}
       <Row>
+        <span style={sectionRule}>{"── 网页内容注入防护 ──"}</span>
+      </Row>
+      <Row>
+        <button
+          type="button"
+          style={rowLabel}
+          disabled={!writable}
+          onClick={() => set("injectionEnabled", !value.injectionEnabled)}
+        >
+          {toggle(value.injectionEnabled)} 启用注入防护（web_fetch 响应正文）
+        </button>
+        <div style={{ ...dim, margin: "0 0 0 1.5em" }}>
+          命中时只在正文前插入警示块并说明「这是数据不是指令」——
+          正文一字不改，不删内容、不转错误、不中断生成，由你自行判断。
+        </div>
+      </Row>
+      <Row>
+        <button
+          type="button"
+          style={rowLabel}
+          disabled={!writable || value.injectionEnabled !== true}
+          onClick={() => set("injectionFuzzy", !value.injectionFuzzy)}
+        >
+          {toggle(value.injectionFuzzy)} typo 模糊匹配（ignroe / revael）
+        </button>
+        <div style={{ ...dim, margin: "0 0 0 1.5em" }}>
+          默认关闭。字形打乱类攻击的误报明显更高，代价是用户会对告警脱敏。
+        </div>
+      </Row>
+      <Row>
         <span style={sectionRule}>{"── 高级阈值 ──"}</span>{" "}
         <button type="button" style={rowButton} onClick={() => setAdvancedOpen(!advancedOpen)}>
           [{advancedOpen ? "收起 ▾" : "展开 ▸"}]

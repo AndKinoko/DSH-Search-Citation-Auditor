@@ -12,11 +12,14 @@
  * 都以 host 的 settings.json 为唯一真源，不依赖 harness 的 settings 服务
  * （其命名空间注册在当前宿主环境不可靠，实测 settings-not-exposed）。
  */
-import type { ClientContext } from "@deepseek-ai/dsh-client-runtime/client";
-// Type-only：拉 Context 合并（ctx.slots / ctx.settingsScope / ctx.sessions），运行时零依赖
-import type {} from "@deepseek-ai/dsh-client-ui-slots";
+import type { Context } from "@deepseek-ai/cordis";
+// Type-only：拉 Context 合并（ctx.slots / ctx.uiConversation / ctx.sessions），运行时零依赖。
+// 0.2.0 起 client 侧统一走 cordis Context + 声明合并，已无独立的 ClientContext 类型
+// （旧版所在的 @deepseek-ai/dsh-client-runtime 在 0.2.0 没有对应版本线）。
+import type {} from "@deepseek-ai/dsh-client-ui-renderer/client";
 import type {} from "@deepseek-ai/dsh-client-ui-settings/client";
 import type {} from "@deepseek-ai/dsh-client-ui-conversation/client";
+import type {} from "@deepseek-ai/dsh-client-ui-chat/client";
 // Type-only：拉 SlotMap 合并（tool.call.toolview 键存在），运行时零依赖
 import type {} from "@deepseek-ai/dsh-client-ui-tool/client";
 import { CitationSettingsCard } from "./SettingsCard.js";
@@ -24,15 +27,18 @@ import { CitationAuditRow } from "./AuditReportCard.js";
 import { mountFloatWindow } from "./FloatWindow.js";
 
 /**
- * client 需要的宿主服务。sessions 供悬浮窗读当前会话的最近回复；
- * uiConversation 提供对话节点（ChatSnapshot）——新宿主悬浮窗的数据层。
- * 该服务经 dsh.client.inject 声明的 @deepseek-ai/dsh-client-ui-conversation 提供。
+ * client 需要的宿主服务。slots 供三处注册；sessions 供悬浮窗读当前会话；
+ * uiConversation 提供对话节点（ChatSnapshot）——悬浮窗的数据层。
+ *
+ * 0.2.0 变更：移除了 settingsScope（该服务在 0.2.0 已不存在）。cordis 对永远
+ * 不会满足的 inject 会一直挂起该 fiber，导致整个 apply 都不执行——比运行时报错
+ * 更难排查，故此处只列确实存在的服务。
  */
-export const inject = ["slots", "settingsScope", "sessions", "uiConversation"];
+export const inject = ["slots", "sessions", "uiConversation"];
 
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   // 悬浮窗：uiConversation 是硬依赖（对话节点所在层），随 inject 就绪。
-  // 老宿主无该服务时按宿主声明版本（>=0.1.1-rc.1）本就不应挂载悬浮窗。
+  // 挂载失败可接受：设置卡片与报表不受影响。
   try {
     mountFloatWindow(ctx);
   } catch {

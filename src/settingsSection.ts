@@ -15,6 +15,7 @@ import Schema from "@deepseek-ai/schemastery";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Settings } from "./auditor/types.js";
 import { DEFAULT_ENFORCEMENT, DEFAULT_SCORING, type EnforcementAction } from "./auditor/types.js";
+import { DEFAULT_INJECTION } from "./auditor/injection/types.js";
 
 /** client 可见的扁平 section 形状（设置文档用户层存的就是它）。 */
 export interface CitationSettingsSection {
@@ -35,6 +36,11 @@ export interface CitationSettingsSection {
   scoringUrlIpBonus: number;
   scoringUrlShortenerBonus: number;
   scoringUrlTrackingBonus: number;
+  /** 网页内容注入防护（v0.4）：web_fetch 响应正文的注入检测。 */
+  injectionEnabled: boolean;
+  injectionFuzzy: boolean;
+  injectionFuzzyThreshold: number;
+  injectionScanMaxBytes: number;
 }
 
 /** 设置命名空间：kebab-case，client 侧 settingsScope.bind 用同名。 */
@@ -62,6 +68,10 @@ export function makeSectionSchema(): Schema<CitationSettingsSection> {
     scoringUrlIpBonus: Schema.number().default(DEFAULT_SCORING.urlIpBonus).description("IP 直连加分"),
     scoringUrlShortenerBonus: Schema.number().default(DEFAULT_SCORING.urlShortenerBonus).description("短链域名加分"),
     scoringUrlTrackingBonus: Schema.number().default(DEFAULT_SCORING.urlTrackingBonus).description("追踪参数加分"),
+    injectionEnabled: Schema.boolean().default(true).description("网页注入防护：web_fetch 正文命中注入时前置警示块（正文不改）"),
+    injectionFuzzy: Schema.boolean().default(false).description("typo 模糊匹配（误报较高，按需开启）"),
+    injectionFuzzyThreshold: Schema.number().default(1).description("typo 编辑距离阈值"),
+    injectionScanMaxBytes: Schema.number().default(DEFAULT_INJECTION.scanMaxBytes).description("单块扫描上限（字节）"),
   }) as Schema<CitationSettingsSection>;
 }
 
@@ -73,6 +83,7 @@ function clampInt(v: unknown, fallback: number, min: number, max: number): numbe
 /** 插件 Settings → 扁平 section（挂载时的 base 层）。 */
 export function settingsToSection(s: Settings): CitationSettingsSection {
   const scoring = { ...DEFAULT_SCORING, ...(s.scoring ?? {}) };
+  const inj = { ...DEFAULT_INJECTION, ...(s.injection ?? {}) };
   return {
     enabled: s.enabled,
     mode: s.mode,
@@ -89,12 +100,17 @@ export function settingsToSection(s: Settings): CitationSettingsSection {
     scoringUrlIpBonus: scoring.urlIpBonus,
     scoringUrlShortenerBonus: scoring.urlShortenerBonus,
     scoringUrlTrackingBonus: scoring.urlTrackingBonus,
+    injectionEnabled: inj.enabled,
+    injectionFuzzy: inj.fuzzy,
+    injectionFuzzyThreshold: inj.fuzzyThreshold,
+    injectionScanMaxBytes: inj.scanMaxBytes,
   };
 }
 
 /** 扁平 section → 插件 Settings（保留不归设置面板管的字段，如 ageQuery.code 与未暴露的 scoring 键）。 */
 export function sectionToSettings(section: CitationSettingsSection, current: Settings): Settings {
   const scoring = { ...DEFAULT_SCORING, ...(current.scoring ?? {}) };
+  const inj = { ...DEFAULT_INJECTION, ...(current.injection ?? {}) };
   return {
     ...current,
     enabled: section.enabled,
@@ -113,6 +129,13 @@ export function sectionToSettings(section: CitationSettingsSection, current: Set
           ? section.enforcementBlocklist
           : (current.enforcement?.blocklist ?? DEFAULT_ENFORCEMENT.blocklist),
     },
+    injection: {
+      ...inj,
+      enabled: section.injectionEnabled,
+      fuzzy: section.injectionFuzzy,
+      fuzzyThreshold: clampInt(section.injectionFuzzyThreshold, inj.fuzzyThreshold, 1, 2),
+      scanMaxBytes: clampInt(section.injectionScanMaxBytes, inj.scanMaxBytes, 4096, 8 * 1024 * 1024),
+    },
     scoring: {
       ...scoring,
       cutoffYear: clampInt(section.scoringCutoffYear, scoring.cutoffYear, 2000, 2100),
@@ -126,41 +149,68 @@ export function sectionToSettings(section: CitationSettingsSection, current: Set
   };
 }
 
-export interface SettingsSectionSink {
-  /** 当前权威 section（installSettingsSection 的 setSource 接住的）。 */
-  (): CitationSettingsSection;
+/**
+ * SettingsForms 上本插件用到的成员（最小面）。
+ *
+ * 0.2.0 起 dsh-settings 只导出 `SettingsForms` 类（实例挂在 `ctx.settings` 上），
+ * 提供 configure / describe / update / replace / mutate。旧代的
+ * `installSettingsSection` 与 `settingsNamespace` 在 0.2.0 已彻底移除，
+ * 本文件不再保留对它们的兼容分支——`engines.dsh >= 0.2.0-rc.2` 这个门槛
+ * 表达的是作者的兼容意图，但截至 0.2.0-rc.2 DSH 侧尚无读取 engines 的实现，
+ * 所以真正挡住旧宿主的是 peerDependencies 的版本范围，留着反而是没人会走到的死代码。
+ *
+ * 这里仍用能力探测（看有没有 configure）而非版本号比较：包版本与 API 代际并非
+ * 严格一一对应（rc 通道常有跳版），看有没有那个方法更可靠。
+ */
+interface SettingsFormsLike {
+  configure(presentation: { auto?: boolean }, owner?: unknown): () => void;
 }
 
 /**
- * 在 settings 服务存在时安装设置命名空间。可选拳：没有 settings 服务的宿主
+ * 在 settings 服务存在时接上设置命名空间。可选拳：没有 settings 服务的宿主
  * （纯 CLI 用法）跳过安装，插件仍以 settings.json 为配置运行。
+ *
+ * 本插件带自己的设置页面（client 的 CitationSettingsCard），所以登记
+ * auto:false——告诉 settings 服务别再按 Config schema 自动生成一页。
+ * 这里只做「存在性声明」，不接管数据真源——settings.json 始终是唯一真源
+ * （见本文件头部的设计取舍），这与 SettingsForms「不维护独立权威值、只投影
+ * Loader 配置」的取向一致。
+ *
+ * 经 unknown 桥接：能力探测发生在运行时，编译期拿不到 SettingsForms 的具体类型
+ * （dsh-settings 是 optional peer，类型 import 会让无该包的宿主编译失败）。
  */
-export function installSettingsCard(
-  ctx: Context,
-  base: CitationSettingsSection,
-  onChange: (section: CitationSettingsSection) => void,
-): void {
-  ctx.inject(["settings"], () => {
-    void import("@deepseek-ai/dsh-settings")
-      .then(({ installSettingsSection, settingsNamespace }) => {
-        let current: SettingsSectionSink = () => base;
-        installSettingsSection<CitationSettingsSection>(
-          ctx,
-          settingsNamespace(SETTINGS_NAMESPACE),
-          makeSectionSchema(),
-          base,
-          {
-            setSource: (source) => {
-              current = source;
-            },
-            onChange: () => {
-              onChange(current());
-            },
-          },
+export function installSettingsCard(ctx: Context): void {
+  ctx.inject(["settings"], (sc) => {
+    const forms = (sc as unknown as { settings?: SettingsFormsLike }).settings;
+    if (forms === undefined || typeof forms.configure !== "function") {
+      // 非预期的 settings 实现（第三方或未来版本）：静默缺席，host 工具不受影响
+      return;
+    }
+    sc.effect(() => {
+      try {
+        // owner 必须是**插件自身的 fiber**（apply 里拿到的 ctx.fiber）。
+        //
+        // 此前传的是 sc.fiber，但 ctx.inject(deps, cb) 是 ctx.plugin({inject, apply: cb})
+        // 的简写（cordis registry.d.ts:104），会创建一个**子 fiber**——那个子 fiber
+        // 永远不是 config-editor 的 entry fiber。而 dsh-settings 的实现是
+        //   configure(presentation, owner = this.ctx.fiber) → presentations.set(owner, …)
+        //   describe() → presentations.get(entry.fiber)?.auto ?? true
+        // 键是 owner、查的是 entry.fiber，两者对不上就永远查不到，autoGenerate 一律
+        // 回落 true —— 也就是 auto:false 从未生效，dsh-settings 照样自动生成一页
+        // 暴露 statePath 的配置页。无报错、无日志，页面看着还挺合理，所以没人会发现。
+        // 不传 schema 与 section：SettingsForms 投影的是插件自己的 Config，
+        // 不接受插件自备的表单 schema。
+        return forms.configure({ auto: false }, ctx.fiber);
+      } catch (err) {
+        // 登记失败不再静默：早前的注释说这里只为「同一实例重复登记」兜底，但 owner
+        // 换成子 fiber 之后那种情况根本不会发生，于是这个 catch 实际上只会吞掉真
+        // 故障（例如未来 SettingsForms 改签名），让插件"看起来在工作"却没做它声称
+        // 做的事。至少要能被诊断到。
+        (sc as unknown as { logger?: { warn: (m: string) => void } }).logger?.warn?.(
+          `citation-auditor: SettingsForms.configure 失败 — ${err instanceof Error ? err.message : String(err)}`,
         );
-      })
-      .catch(() => {
-        // dsh-settings 不可用（版本过旧/未装）：设置卡片静默缺席，host 工具不受影响
-      });
+        return () => {};
+      }
+    }, "settings.configure citation-auditor");
   });
 }

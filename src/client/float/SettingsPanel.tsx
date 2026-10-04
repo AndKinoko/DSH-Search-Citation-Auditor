@@ -164,6 +164,28 @@ export function SettingsPanel({ settingsData, settingsFailed, onSetSetting, onOp
             ) : null}
           </div>
           <div style={{ marginTop: 6 }}>
+            <div style={dim}>网页内容注入防护（web_fetch 响应正文）</div>
+            <label style={{ display: "block", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={s.injectionEnabled}
+                onChange={(e) => onSetSetting("injectionEnabled", e.target.checked)}
+              />
+              {" 启用（命中时在正文前插入警示块，正文一字不改）"}
+            </label>
+            <label style={{ display: "block", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={s.injectionFuzzy}
+                onChange={(e) => onSetSetting("injectionFuzzy", e.target.checked)}
+              />
+              {" typo 模糊匹配（ignroe/revael，误报较高）"}
+            </label>
+            <div style={{ ...dim, fontSize: 11 }}>
+              处置只有「仅提示」一档：不删改正文、不中断生成，由你自行判断是否停。
+            </div>
+          </div>
+          <div style={{ marginTop: 6 }}>
             <div style={dim}>年龄查询</div>
             <label style={{ display: "block", cursor: "pointer" }}>
               <input

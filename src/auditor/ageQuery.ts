@@ -65,7 +65,22 @@ function describeValue(v: unknown): string {
 /** 在独立线程执行用户片段；超时 terminate，同步死循环也不会卡住主线程。 */
 function runUserCodeInWorker(code: string, domain: string, timeoutMs: number): Promise<WorkerOutcome> {
   return new Promise((resolve) => {
-    const worker = new Worker(WORKER_BOOT, { eval: true, workerData: { code, domain } });
+    // CPU 隔离由超时 + terminate() 提供；但**内存**此前完全不受限：一个持续分配
+    // 的片段能把宿主进程 RSS 推到 4000 MB 才被 5s 超时杀掉——小内存机器上直接 OOM，
+    // 而这恰恰是本模块声称要防的「拖垮常驻进程」。resourceLimits 让越界的 worker
+    // 自己抛出 RangeError 并退出。
+    // execArgv: [] 另有一层好处：宿主若带 --inspect 启动，每个 worker 都会去抢同一个
+    // 调试端口而失败。
+    const worker = new Worker(WORKER_BOOT, {
+      eval: true,
+      workerData: { code, domain },
+      resourceLimits: {
+        maxOldGenerationSizeMb: 256,
+        maxYoungGenerationSizeMb: 32,
+        stackSizeMb: 4,
+      },
+      execArgv: [],
+    });
     let settled = false;
     const finish = (outcome: WorkerOutcome) => {
       if (settled) return;
