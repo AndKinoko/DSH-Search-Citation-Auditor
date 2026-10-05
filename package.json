@@ -45,7 +45,9 @@
     "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json && tsdown",
-    "test": "npm run build && node --test lib/test/core.test.js lib/test/settings.test.js lib/test/float.test.js lib/test/floatPos.test.js lib/test/webBlock.test.js lib/test/injection.test.js lib/test/routeGuard.test.js lib/test/security.test.js",
+    "test": "npm run build && node --test lib/test/core.test.js lib/test/settings.test.js lib/test/float.test.js lib/test/floatPos.test.js lib/test/sessionPick.test.js lib/test/interaction.test.js lib/test/webBlock.test.js lib/test/injection.test.js lib/test/routeGuard.test.js lib/test/security.test.js",
+    "test:e2e": "node scripts/e2e-injection.mjs",
+    "test:all": "npm test && npm run test:e2e",
     "verify": "node scripts/verify-plugin.mjs .",
     "verify:pack": "node scripts/verify-plugin.mjs . --pack",
     "pack": "npm pack --dry-run"

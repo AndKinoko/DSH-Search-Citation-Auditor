@@ -1,7 +1,7 @@
 /**
  * 设置面板：模式选择、拦截名单开关、年龄查询测试、文件打开。
  */
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useEffect } from "react";
 import { MODE_LABEL } from "../constants.js";
 import { ENFORCEMENT_LABEL, type EnforcementAction } from "../../auditor/types.js";
 import type { CitationSettingsSection } from "../../settingsSection.js";
@@ -28,6 +28,48 @@ const SCORING_FIELDS: ReadonlyArray<{ key: keyof CitationSettingsSection; label:
   { key: "scoringUrlShortenerBonus", label: "短链加分", min: 0, max: 100 },
   { key: "scoringUrlTrackingBonus", label: "追踪参数加分", min: 0, max: 100 },
 ];
+
+/**
+ * 数字字段：草稿值与已落盘值分离。
+ *
+ * 问题见 M9-a：`Number("") === 0` 会通过 isFinite 守卫并被钳到最小值，
+ * 全选后重输不可能，且 300ms 的自动 refetch 会把输入中的数字回滚。
+ * 本地草稿 + blur/Enter 提交：输入中只管本地，提交时做一次 clamp。
+ */
+function ScoringField({ f, value, onSet }: { f: { key: keyof CitationSettingsSection; label: string; min: number; max: number }; value: CitationSettingsSection; onSet: (key: keyof CitationSettingsSection, v: number) => void }): React.ReactElement {
+  const [draft, setDraft] = useState<string | null>(null);
+  useEffect(() => {
+    setDraft(null);
+  }, [value[f.key]]);
+  const shown = draft ?? String(value[f.key]);
+  const commit = useCallback((): void => {
+    if (draft === null) return;
+    setDraft(null);
+    const raw = draft.trim();
+    if (raw === "") return; // 清空=放弃本次输入，不回写，不回滚
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return; // 非法=放弃，不回写
+    onSet(f.key, Math.min(f.max, Math.max(f.min, Math.round(n))));
+  }, [draft, f, onSet]);
+  return (
+    <label style={{ display: "block", margin: "2px 0" }}>
+      <span style={{ ...dim, fontSize: 12 }}>{`${f.label} `}</span>
+      <input
+        type="number"
+        min={f.min}
+        max={f.max}
+        value={shown}
+        style={{ width: 72, fontFamily: "inherit", fontSize: 12 }}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+      />
+    </label>
+  );
+}
+
 
 export function SettingsPanel({ settingsData, settingsFailed, onSetSetting, onOpenFile }: SettingsPanelProps): React.ReactElement {
   const [ageTest, setAgeTest] = useState<{ running: boolean; result: string | null }>({ running: false, result: null });
@@ -144,24 +186,18 @@ export function SettingsPanel({ settingsData, settingsFailed, onSetSetting, onOp
             {advancedOpen ? (
               <div style={{ marginTop: 4 }}>
                 {SCORING_FIELDS.map((f) => (
-                  <label key={f.key} style={{ display: "block", margin: "2px 0" }}>
-                    <span style={{ ...dim, fontSize: 12 }}>{`${f.label} `}</span>
-                    <input
-                      type="number"
-                      min={f.min}
-                      max={f.max}
-                      value={Number(s[f.key])}
-                      style={{ width: 72, fontFamily: "inherit", fontSize: 12 }}
-                      onChange={(e) => {
-                        const n = Number(e.target.value);
-                        if (Number.isFinite(n)) onSetSetting(f.key, Math.min(f.max, Math.max(f.min, Math.round(n))));
-                      }}
-                    />
-                  </label>
+                  <ScoringField key={f.key} f={f} value={s} onSet={(key, v) => onSetSetting(key, v)} />
                 ))}
                 <div style={{ ...dim, fontSize: 11 }}>其余 scoring 键直接改 settings.json 即生效。</div>
               </div>
             ) : null}
+          {advancedOpen ? (
+            <div style={{ marginTop: 4 }}>
+              {SCORING_FIELDS.map((f) => (
+                <ScoringField key={f.key} f={f} value={s} onSet={(key, v) => onSetSetting(key, v)} />
+              ))}
+            </div>
+          ) : null}
           </div>
           <div style={{ marginTop: 6 }}>
             <div style={dim}>网页内容注入防护（web_fetch 响应正文）</div>

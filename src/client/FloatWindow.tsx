@@ -22,7 +22,7 @@
  * 同一条管道），模式、名单、年龄缓存天然一致。
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import type { Context } from "@deepseek-ai/cordis";
 import type { ISessions } from "@deepseek-ai/dsh-api-session-controller/client";
 import type { SessionId } from "@deepseek-ai/dsh-client-connection/client";
@@ -61,21 +61,51 @@ const PANEL_MAX_H = 0.6;
 /**
  * 展开面板里**不允许**触发拖拽的元素：点它们要执行动作，而不是挪窗口。
  *
- * 只排交互控件，刻意不排 `a`：域名是 `<button>`（走 onOpenDomain），不是裸链接。
- * 也没有把非交互文字区标成「可选区让开」——正文是域名列表、几乎全是按钮，硬让开
- * 会让用户在按钮上点不动；更关键的是标题栏这类非交互区域**必须**能拖：用户第一
- * 反应就是去拖标题栏，它一被排除就会表现为「全框可拖没生效 / 拖不动」。
+ * 只排交互控件。刻意不排 `a`：域名是 `<button>`（走 onOpenDomain），不是裸链接。
+ * 也没有把非交互文字区标成「可选区让开」：正文是「域名 + 原因」的审计列表，
+ * 长按选中不是这里的高频动作，而排除大面积文字后，剩下的可拖面积只剩标题栏与
+ * 行间距——回顾起来正是当初「全框可拖没生效」的心理根源。标题栏本身是非交互区，
+ * 必然能拖；按钮各自命中本选择器，互不干扰。
  */
 const NO_DRAG_SELECTOR = "button, input, select, textarea, [role='button'], [data-no-drag]";
+
+/**
+ * 悬浮球自身的标记：它是「拖拽热区 + 点击入口」二合一，**必须**能接收指针事件。
+ *
+ * 修订记录（阻断级 bug，2026-10-05 实网验证）：悬浮球为做键盘可达性加了
+ * `role="button"`，而 role 命中上面那条 NO_DRAG_SELECTOR，于是球把自己排除了：
+ *
+ *   div[data-citation-auditor-ball][role=button]
+ *     └─ span[aria-hidden] 🛡        ← 指针落点
+ *
+ * `aria-hidden` 只影响读屏，不影响 `closest()`。于是 shouldSkipDrag 恒为 true，
+ * `onPointerDown` 早退、不写 `dragRef`，`finish` 又因 `drag === null` 直接返回——
+ * `openPanel()` 永不执行：点击与拖拽双双失效，面板再也打不开。
+ *
+ * 教训写在这里以免复发：NO_DRAG_SELECTOR 的本意是「排掉面板里的操作按钮」，
+ * 不是「排掉球自己」。凡是把 role/aria 属性加到**热区根元素**上的可拖元素，
+ * 都必须在此显式豁免。aria-* 属性同理无害（不进选择器），但 role 是会进的。
+ */
+const DRAG_ALWAYS_SELECTOR = "[data-citation-auditor-ball]";
 
 function tuple(b: { lo: number; hi: number }): [number, number] {
   return [b.lo, b.hi];
 }
 
-/** 指针事件的合成路径上是否应当跳过拖拽。 */
-function shouldSkipDrag(target: EventTarget | null, el: Element): boolean {
+/**
+ * 指针事件的合成路径上是否应当跳过拖拽。
+ *
+ * 判定顺序要紧：先看目标是否落在「永不排除」的热区里，命中就直接放行，
+ * 否则再套 NO_DRAG_SELECTOR。反过来写会让热区根元素上的 role 反过来把自己挡掉。
+ *
+ * 导出供测试直接断言：本函数此前只经由 React 事件间接生效，于是「悬浮球被自己的
+ * role 排除」这类阻断级缺陷能在 187 条全绿的测试下溜过去——交互层没有测试网。
+ */
+export function shouldSkipDrag(target: EventTarget | null, el: Element): boolean {
   if (!(target instanceof Element)) return false;
   if (el.contains(target) === false) return false;
+  // 悬浮球整体是热区：球内的图标 span、角标 span 一律放行
+  if (target.closest(DRAG_ALWAYS_SELECTOR) !== null) return false;
   return target.closest(NO_DRAG_SELECTOR) !== null;
 }
 
@@ -120,34 +150,243 @@ interface UiConversationLike {
   binding(id: SessionId): { target(name: string): { getSnapshot(): unknown | undefined; subscribe(fn: () => void): () => void } | undefined } | undefined;
 }
 
+/** SessionBinding 的宽松投影：只要旧宿主兜底路径用的 session 快照源。 */
+interface SessionBindingLike {
+  session?: {
+    subscribe(fn: () => void): () => void;
+    getSnapshot(): unknown;
+  };
+}
+
+/**
+ * 为当前会话持有一个独立引用，切换会话时释放上一个。
+ *
+ * 没有它就拿不到 binding：ISessions.binding(id) 只「借用已 retain 的 generation」，
+ * 不自己 retain 就等于没有 generation。reference.ready 是首次历史打开的等待点，
+ * 不用 await——快照订阅会在历史到达后自行推送，这里只需要拿到引用对象本身。
+ */
+function useRetainedSession(
+  sessions: ISessions,
+  sessionId: SessionId | undefined,
+): { sessionId: SessionId; binding: SessionBindingLike } | undefined {
+  const [reference, setReference] = useState<{ sessionId: SessionId; binding: SessionBindingLike } | undefined>();
+  useEffect(() => {
+    if (sessionId === undefined) {
+      setReference(undefined);
+      return;
+    }
+    let live = true;
+    let held: { release(): void } | undefined;
+    try {
+      const ref = (sessions as unknown as {
+        retain(id: SessionId, opts: { source: string }): { binding: SessionBindingLike; release(): void };
+      }).retain(sessionId, { source: CITE_SOURCE });
+      held = ref;
+      if (live) setReference({ sessionId, binding: ref.binding });
+      else ref.release();
+    } catch {
+      // retain 失败（会话刚被关闭等）：退回借用路径，下面 binding 仍会尝试 sessions.binding。
+      if (live) setReference(undefined);
+    }
+    return () => {
+      live = false;
+      try {
+        held?.release();
+      } catch {
+        /* 释放失败不应影响切换 */
+      }
+    };
+  }, [sessions, sessionId]);
+  // 切换会话时立刻清空，避免旧会话的 binding 被继续使用一帧。
+  //
+  // 同步性说明：这里的清空只是 state 层面。真正的释放发生在 effect 回收里，
+  // 宿主的 publishRetention→list.set 还要再推一轮快照——所以切会话后有一帧
+  // 旧引用仍在 retainedBy 里计数。pickCurrentSession 那边已排除自己的 source，
+  // 这一帧不会误判；这里的同步清空只是防止 binding 被多用一渲染。
+  return reference?.sessionId === sessionId ? reference : undefined;
+}
+
 /** ChatSnapshot.legacy 的宽松投影（见 floatData.ChatLegacyLike）。 */
 interface ChatTargetSnapLike {
   legacy?: ChatLegacyLike;
+}
+
+/** ISessions.list 快照的宽松投影：只要 ids 与 byId 的引用计数。 */
+interface SessionListLike {
+  current?: SessionId;
+  ids?: readonly SessionId[];
+  byId?: Readonly<Record<string, { running?: boolean; retainedBy?: Readonly<Partial<Record<string, number>>> }>>;
+}
+
+/** 本插件在 retainInfo/retain 里的来源标签（声明合并可扩展，这里用独立标签）。 */
+const CITE_SOURCE = "citationAuditorFloat";
+
+/**
+ * 从列表快照里挑出「当前正在看的那个会话」。
+ *
+ * 不能用 ids[0]：0.2.0 的 SessionListState 是 { ids, byId, phase,
+ * projectionsBySession }，**没有 current**，导航归视图属主所有。ids 是宿主列表
+ * 顺序（通常最近在前），与用户当前打开的是哪个会话无关——切到第二个会话，浮窗
+ * 仍在审计第一个，面板显示的是上一段对话的结论且没有任何提示。
+ *
+ * 可靠信号按优先级：
+ *  1. scopeId（调用方经 sessions.scopeOf(ctx) 拿到）：宿主给每个 Agent 作用域挂的
+ *     scope 标签，直接点出「这个插件挂在哪个会话的作用域下」。最权威。
+ *  2. 他人 retain 计数：宿主里真正渲染某个会话的组件必然 retain 着它，而后台
+ *     列表里的会话不会被 retain。这个值随 list 快照一起推，不需要额外订阅。
+ *
+ * 反自锁：调用方**必须**把浮窗自己的 source 传进来（excludeSource），自己的持有
+ * 不算票。否则选错一次就锁死——useRetainedSession 用同一 source 持有选中的会话，
+ * 下一次快照里它的 retainedBy 必然非空，形成「选 A→持有 A→A 有计数→继续选 A」
+ * 的正反馈。2026-10-06 实测症状：用户切到 B，面板仍在显示 A 的上一条结论。
+ */
+export function pickCurrentSession(
+  list: SessionListLike | undefined,
+  opts?: { scopeId?: SessionId; excludeSource?: string },
+): SessionId | undefined {
+  if (list === undefined) return undefined;
+  const ids = Array.isArray(list.ids) ? list.ids : [];
+  const byId = list.byId ?? {};
+  // 宿主作用域标签最权威：插件自己挂在哪个会话下，就看哪个。
+  if (opts?.scopeId !== undefined && ids.includes(opts.scopeId)) return opts.scopeId;
+  // 旧宿主若仍带 current 就优先用它。
+  if (list.current !== undefined) return list.current;
+  const retained = ids.filter((id) => {
+    const counts = byId[id]?.retainedBy;
+    if (counts === undefined) return false;
+    // 自己的持有不算票：只看他人的计数。
+    return Object.entries(counts).some(
+      ([source, n]) => source !== opts?.excludeSource && typeof n === "number" && n > 0,
+    );
+  });
+  if (retained.length > 0) return retained[0];
+  // 全都没人 retain（例如宿主尚未打开任何会话）时退回列表首位，至少不空白。
+  return ids[0];
+}
+
+/**
+ * 扫描请求：序号令牌 + 可取消。
+ *
+ * 问题见 M9-b：旧实现无 AbortController、无序号令牌，且请求发起前就推进「已审计」
+ * 水位；两条回复的请求在飞时，后到的旧响应覆盖新结论；失败的审计也被标记为
+ * 「已审计」，下次快照变更时不再触发，于是面板卡在上一条回复的判决旁附一条错误横幅。
+ *
+ * 现在：每次扫描带单调递增序号，竞态只取最后一次完成；请求体走 AbortController，
+ * 新扫描到来时旧请求的网络与回调一并作废；已审计水位只在**成功**后推进——失败永不
+ * 推进，下一次快照变更时照常重试。
+ */
+function useAuditRequest(): {
+  analyzing: boolean;
+  failed: boolean;
+  audit: AuditData | undefined;
+  auditedText: string | null;
+  request: (text: string) => void;
+  retry: () => void;
+  reset: () => void;
+} {
+  const [audit, setAudit] = useState<AuditData | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [auditedText, setAuditedText] = useState<string | null>(null);
+  const seqRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const lastTextRef = useRef<string | null>(null);
+
+  const request = useCallback((text: string): void => {
+    const seq = (seqRef.current += 1);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    lastTextRef.current = text;
+    setAnalyzing(true);
+    setFailed(false);
+    fetch("/api/citation-auditor/audit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+      signal: controller.signal,
+    })
+      .then((r) => (r.ok ? (r.json() as Promise<AuditData>) : Promise.reject(new Error(String(r.status)))))
+      .then((d) => {
+        if (seq !== seqRef.current) return; // 旧请求后到，直接丢弃
+        if (d.ok) {
+          setAuditedText(text); // 只在成功后推进水位
+          setAudit(d);
+          setFailed(false);
+        } else {
+          setFailed(true);
+        }
+      })
+      .catch((err: unknown) => {
+        if (err instanceof Error && err.name === "AbortError") return; // 被新请求取代，不算失败
+        if (seq !== seqRef.current) return;
+        setFailed(true); // 水位不动：下次变更照常重试
+      })
+      .finally(() => {
+        if (seq === seqRef.current) setAnalyzing(false);
+      });
+  }, []);
+
+  const retry = useCallback((): void => {
+    if (lastTextRef.current !== null) request(lastTextRef.current);
+  }, [request]);
+
+  const reset = useCallback((): void => {
+    seqRef.current += 1; // 作废在飞请求
+    abortRef.current?.abort();
+    abortRef.current = null;
+    lastTextRef.current = null;
+    setAuditedText(null);
+    setAudit(undefined);
+    setFailed(false);
+    setAnalyzing(false);
+  }, []);
+
+  return {
+    analyzing,
+    failed,
+    audit,
+    auditedText,
+    request,
+    retry,
+    reset,
+  };
 }
 
 /** 悬浮窗本体：由 mountFloatWindow 挂到 document.body 的独立 React 根上。 */
 export function CitationAuditorFloatWindow(props: {
   sessions: ISessions;
   uiConversation?: UiConversationLike;
+  /** 插件挂载点所在的作用域会话（mountFloatWindow 经 sessions.scopeOf(ctx) 读出）。 */
+  scopeId?: SessionId;
 }): React.ReactElement {
-  const { sessions, uiConversation } = props;
+  const { sessions, uiConversation, scopeId } = props;
 
   // 当前会话 id（列表快照；切会话/无会话都会推新快照）
   //
   // 0.2.0 变更：SessionListState 不再有 `current` —— 该服务注释明说「导航归视图
   // 属主所有」，运行时快照确认为 { ids, byId, phase, projectionsBySession }。
-  // 悬浮窗挂在 document.body、位于会话树之外，拿不到 shell 下发的 scope prop，
-  // 只能退取列表首位（ids 是宿主列表顺序，通常最近会话在前）。
-  // 旧宿主若仍带 current 则优先用它，故这里按可选字段读取。
+  // 信号按优先级：scopeId（宿主作用域标签，最权威）→ 旧宿主 current →
+  // 他人 retain 计数（排除浮窗自己的持有，避免正反馈自锁）→ 列表首位。
   const list = useSyncExternalStore(
     useMemo(() => sessions.list.subscribe.bind(sessions.list), [sessions]),
     useMemo(() => sessions.list.getSnapshot.bind(sessions.list), [sessions]),
-  ) as { current?: SessionId; ids?: readonly SessionId[] } | undefined;
-  const current: SessionId | undefined =
-    list?.current ?? (Array.isArray(list?.ids) ? list.ids[0] : undefined);
+  ) as SessionListLike | undefined;
+
+  const current = useMemo(
+    () => pickCurrentSession(list, { scopeId, excludeSource: CITE_SOURCE }),
+    [list, scopeId],
+  );
+
+  // 必须自己 retain：ISessions.binding(id) 的契约是「借用已 retain 的 binding，
+  // 不延长生命周期；没有 retained generation 就返回 undefined」。浮窗是独立 React
+  // 根，不在宿主的会话作用域里，没人会替它 retain——不自己持有就永远拿不到
+  // binding，浮窗就只能一直停在「等最近一次回复定稿后自动分析」。
+  const retained = useRetainedSession(sessions, current);
+
   const binding = useMemo(
-    () => (current !== undefined ? sessions.binding(current) : undefined),
-    [sessions, current],
+    () => (current !== undefined ? (retained?.binding ?? sessions.binding(current)) : undefined),
+    [sessions, current, retained],
   );
 
   // 新宿主：对话内容在 uiConversation 的 chat target（订阅即激活 target）。
@@ -157,9 +396,11 @@ export function CitationAuditorFloatWindow(props: {
     try {
       return uiConversation.binding(current)?.target("chat");
     } catch {
+      // 宿主 binding 已失效（会话被关掉 / generation 被释放）。这不是错误路径，
+      // 下次 list 快照推送会带着新的 current 重新触发。
       return undefined;
     }
-  }, [uiConversation, current]);
+  }, [uiConversation, current, retained]);
 
   // 会话级快照：running 信号 + 旧宿主兜底（getSnapshot 引用稳定，来自宿主 observable）
   const sessionSnap = useSyncExternalStore(
@@ -211,59 +452,45 @@ export function CitationAuditorFloatWindow(props: {
 
   const settled = isConversationSettled(snapshot);
   const text = useMemo(() => settledAssistantText(nodes), [nodes]);
+  const {
+    analyzing,
+    failed,
+    audit: autoAudit,
+    auditedText,
+    request: requestAudit,
+    retry: retryAudit,
+    reset: resetAudit,
+  } = useAuditRequest();
 
-  const [audit, setAudit] = useState<AuditData | undefined>(undefined);
-  const [failed, setFailed] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
-  const auditedTextRef = useRef<string | null>(null);
+  // 交互报表数据源 = 自动扫描的结论（refresh 只是同一请求的强制触发）
+  const audit = autoAudit;
+
+  // toobig 判据：/audit 路由把 64KB 以上正文直接 400 拒绝，这里的 body 永远整段
+  // 发送，而面板的 failed 横幅统称「数据端点不可达」——真正原因是「这段太长」，
+  // 用户会对着修 host 端点。单独记一个原因位。
+  // 64KB 是 client 与服务端上限共用的预算（见 service.ts 的 MAX_TEXT_CHARS）。
+  const toobig =
+    failed &&
+    text !== null &&
+    audit?.enabled !== false &&
+    new Blob([text]).size > 64 * 1024;
+
+  // 切会话时重置扫描（旧水位与旧结论一律作废，防止串会话）
+  useEffect(() => {
+    resetAudit();
+  }, [current, resetAudit]);
 
   // 回合定稿且文本变化 → 防抖 800ms 后重审计（流式期间不请求）
   useEffect(() => {
-    if (!settled || text === null || text === auditedTextRef.current) return;
-    setAnalyzing(true);
-    const timer = setTimeout(() => {
-      auditedTextRef.current = text;
-      fetch("/api/citation-auditor/audit", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
-      })
-        .then((r) => (r.ok ? (r.json() as Promise<AuditData>) : Promise.reject(new Error(String(r.status)))))
-        .then((d) => {
-          if (d.ok) {
-            setAudit(d);
-            setFailed(false);
-          } else {
-            setFailed(true);
-          }
-        })
-        .catch(() => setFailed(true))
-        .finally(() => setAnalyzing(false));
-    }, 800);
+    if (!settled || text === null || auditedText === text) return;
+    const timer = setTimeout(() => requestAudit(text), 800);
     return () => clearTimeout(timer);
-  }, [settled, text]);
+  }, [settled, text, auditedText, requestAudit]);
 
   const refresh = useCallback((): void => {
     if (text === null) return;
-    auditedTextRef.current = text;
-    setAnalyzing(true);
-    fetch("/api/citation-auditor/audit", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
-    })
-      .then((r) => (r.ok ? (r.json() as Promise<AuditData>) : Promise.reject(new Error(String(r.status)))))
-      .then((d) => {
-        if (d.ok) {
-          setAudit(d);
-          setFailed(false);
-        } else {
-          setFailed(true);
-        }
-      })
-      .catch(() => setFailed(true))
-      .finally(() => setAnalyzing(false));
-  }, [text]);
+    requestAudit(text);
+  }, [text, requestAudit]);
 
   // ---- 设置视图数据（/status）----
   const [settingsData, setSettingsData] = useState<StatusData | undefined>(undefined);
@@ -283,19 +510,39 @@ export function CitationAuditorFloatWindow(props: {
   }, []);
 
   // 名单操作（与 Phase 3 交互报表同一底层 /list 端点）
+  //
+  // 问题见 M9-c：旧实现 `.then(() => refresh()).catch(() => {})` 对“失败”一律
+  // 吞掉——而 fetch 对 4xx 照常 resolve，guardRoute 的 403、`{ok:false}` 的 200
+  // 都走了成功分支。用户点「加入拦截名单」后实际什么都没写入，面板却静默刷新，
+  // 看起来像成功了。现在：一律先验 body 的 ok，再决定成败，失败给出原因并保留
+  // 重试入口（见下方 writeFailed）。
   const [busy, setBusy] = useState(false);
   const [ignored, setIgnored] = useState<ReadonlySet<string>>(new Set());
   const [suppressedModes, setSuppressedModes] = useState<ReadonlySet<string>>(new Set());
+  const [writeFailed, setWriteFailed] = useState<string | null>(null);
   const mutate = useCallback(
     (op: "block" | "unblock" | "whitelist" | "unwhitelist", domain: string): void => {
       setBusy(true);
+      setWriteFailed(null);
       fetch("/api/citation-auditor/list", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ op, domain }),
       })
-        .then(() => refresh())
-        .catch(() => {})
+        .then((r) =>
+          r.ok ? (r.json() as Promise<{ ok: boolean; error?: string }>) : Promise.reject(new Error(`HTTP ${r.status}`)),
+        )
+        .then((d) => {
+          if (d.ok !== true) {
+            throw new Error(d.error ?? "unknown");
+          }
+          refresh();
+        })
+        .catch((err: unknown) => {
+          setWriteFailed(
+            `名单写入失败（${err instanceof Error ? err.message : String(err)}），本次没有落盘——请重试或到设置页确认 host 端点状态。`,
+          );
+        })
         .finally(() => setBusy(false));
     },
     [refresh],
@@ -509,6 +756,7 @@ export function CitationAuditorFloatWindow(props: {
   }, [clampPosToPanel]);
 
   // 悬浮球按自身 44px 钳位；面板按实测尺寸钳位，两者共用同一个 pos，切换时不跳动。
+  // bindDrag 只管指针拖拽；悬浮球的键盘激活由 FloatBall.onActivate 直接调 openPanel。
   const ballDrag = useMemo(() => bindDrag(openPanel, () => ({ w: BALL_SIZE, h: BALL_SIZE })), [bindDrag, openPanel]);
   const headerDrag = useMemo(() => bindDrag(() => {}, panelGrip), [bindDrag, panelGrip]);
 
@@ -535,6 +783,7 @@ export function CitationAuditorFloatWindow(props: {
           nonTrusted={nonTrusted}
           failed={failed}
           hasVerdicts={verdicts.length > 0}
+          onActivate={openPanel}
           dragHandlers={ballDrag}
         />
       ) : (
@@ -564,8 +813,8 @@ export function CitationAuditorFloatWindow(props: {
             fontSize: 13,
             zIndex: 2147483000,
             overflow: "hidden",
-            // 面板整体可拖；但正文要能选字，所以 user-select 保持 text，
-            // 拖拽热区由 shouldSkipDrag 的 SELECTABLE_SELECTOR 让开（选中优先）。
+            // 面板整体可拖（绑定在根元素，见上）；正文要能选字，所以 user-select
+            // 保持 text。按钮全部命中 NO_DRAG_SELECTOR（点击不拖窗）。
             cursor: "default",
             userSelect: "text",
             // 触屏上默认会先滚动/放大，抢走指针序列，拖拽就断在半路。
@@ -658,10 +907,14 @@ export function CitationAuditorFloatWindow(props: {
             <AuditPanel
               analyzing={analyzing}
               failed={failed}
+              toobig={toobig === true}
               auditEnabled={audit?.enabled}
               verdicts={verdicts}
               ignored={ignored}
               busy={busy}
+              writeFailed={writeFailed}
+              onDismissWriteFailed={() => setWriteFailed(null)}
+              onRetryAudit={retryAudit}
               onAddBlocklist={addBlocklist}
               onConfirmRemove={confirmRemove}
               onAddWhitelist={(domain) => mutate("whitelist", domain)}
@@ -687,21 +940,50 @@ export function CitationAuditorFloatWindow(props: {
  */
 export function mountFloatWindow(ctx: Context): () => void {
   if (typeof document === "undefined") return () => {};
+  // 旧实例可能还在页面里（client 热重载时旧 fiber 尚未收尾）。这里**必须 unmount
+  // 它的 React root**，只 remove 容器 node 是不够的：React 树仍然存活，副作用与
+  // 订阅照旧运行，每次 HMR 就多留一份还在发 /audit 请求的实例。
   for (const stale of Array.from(document.querySelectorAll("div[data-citation-auditor-float]"))) {
+    const root = (stale as HTMLElement & { __citationAuditorRoot?: Root }).__citationAuditorRoot;
+    try {
+      root?.unmount();
+    } catch {
+      /* 旧 root 可能已被卸载，忽略 */
+    }
     stale.remove();
   }
   const container = document.createElement("div");
   container.dataset.citationAuditorFloat = "";
   document.body.appendChild(container);
   const root = createRoot(container);
+  (container as HTMLElement & { __citationAuditorRoot?: Root }).__citationAuditorRoot = root;
   // ctx.sessions 的 Context 合并在 host 侧服务类型（dsh-session）与 client
   // runtime 之间同名冲突（skipLibCheck 掩盖声明冲突），使用点显式窄化——
   // dsh-pet 同款处理：as unknown as ISessions
   // uiConversation 已随 client inject 声明（@deepseek-ai/dsh-client-ui-conversation），
   // 此处直接使用注入面；旧宿主缺失该服务时 apply 层不挂载悬浮窗。
   const uiConversation = (ctx as unknown as { uiConversation?: UiConversationLike }).uiConversation;
+  // 插件自身的 Context 若挂在某个会话的 Agent 作用域下，scopeOf 直接点出那个 id。
+  // 这是「当前会话」最权威的信号（见 pickCurrentSession 的注释）：宿主给每个
+  // Agent generation 挂 scope tag，读自己 ctx 上的 tag 即可，不需要猜。
+  // 注意跨包直接 import 会内联第二个模块实例、私有 Symbol 对不上（service.d.ts
+  // 第 216-218 行有明确警告），所以必须经 ctx.sessions 的方法调用。
+  // 挂载点在根上（无 scope）时为 undefined，pickCurrentSession 会退回启发式。
+  let scopeId: SessionId | undefined;
+  try {
+    const sessionsLike = ctx.sessions as unknown as {
+      scopeOf?: (c: unknown) => SessionId | undefined;
+    };
+    scopeId = typeof sessionsLike.scopeOf === "function" ? sessionsLike.scopeOf(ctx) : undefined;
+  } catch {
+    scopeId = undefined;
+  }
   root.render(
-    <CitationAuditorFloatWindow sessions={ctx.sessions as unknown as ISessions} uiConversation={uiConversation} />,
+    <CitationAuditorFloatWindow
+      sessions={ctx.sessions as unknown as ISessions}
+      uiConversation={uiConversation}
+      scopeId={scopeId}
+    />,
   );
   return () => {
     root.unmount();

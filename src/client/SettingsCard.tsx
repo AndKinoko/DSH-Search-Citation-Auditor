@@ -106,6 +106,47 @@ const SCORING_FIELDS: ReadonlyArray<{ key: keyof CitationSettingsSection; label:
   { key: "scoringUrlTrackingBonus", label: "追踪参数加分", min: 0, max: 100 },
 ];
 
+/**
+ * 数字字段：草稿值与已落盘值分离。
+ *
+ * 问题见 M9-a：`Number("") === 0` 会通过 isFinite 守卫并被钳到最小值，
+ * 全选后重输不可能，且 300ms 的自动 refetch 会把输入中的数字回滚。
+ * 本地草稿 + blur/Enter 提交：输入中只管本地，提交时做一次 clamp。
+ */
+function ScoringField({ f, value, onSet, disabled }: { f: { key: keyof CitationSettingsSection; label: string; min: number; max: number }; value: number; onSet: (v: number) => void; disabled: boolean }): React.ReactElement {
+  const [draft, setDraft] = useState<string | null>(null);
+  useEffect(() => {
+    setDraft(null);
+  }, [value]);
+  const shown = draft ?? String(value);
+  const commit = useCallback((): void => {
+    if (draft === null) return;
+    setDraft(null);
+    const raw = draft.trim();
+    if (raw === "") return; // 清空=放弃本次输入，不回写，不回滚
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return; // 非法=放弃，不回写
+    onSet(Math.min(f.max, Math.max(f.min, Math.round(n))));
+  }, [draft, f, onSet]);
+  return (
+    <span>
+      <input
+        type="number"
+        min={f.min}
+        max={f.max}
+        value={shown}
+        disabled={disabled}
+        style={{ fontFamily: MONO, fontSize: 13, width: 80 }}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+      />
+    </span>
+  );
+}
+
 /** 简单模式的纯说明页内容（设计规则 4：唯一无编辑内容的页面）。 */
 function SimpleModeDetail({ ageQueryReady }: { ageQueryReady: boolean }): React.ReactElement {
   return (
@@ -417,18 +458,7 @@ export function CitationSettingsCard(_props: CardInject): React.ReactElement {
             <span style={{ margin: "0 0 0 1.5em" }}>
               {f.label}（{f.min}–{f.max}）:{" "}
             </span>
-            <input
-              type="number"
-              min={f.min}
-              max={f.max}
-              value={Number(value[f.key])}
-              disabled={!writable}
-              style={{ fontFamily: MONO, fontSize: 13, width: 80 }}
-              onChange={(e) => {
-                const n = Number(e.target.value);
-                if (Number.isFinite(n)) set(f.key, Math.min(f.max, Math.max(f.min, Math.round(n))) as never);
-              }}
-            />
+            <ScoringField f={f} value={Number(value[f.key])} disabled={!writable} onSet={(v) => set(f.key, v as never)} />
           </Row>
         ))}
       {advancedOpen && (

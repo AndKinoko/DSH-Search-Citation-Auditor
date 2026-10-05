@@ -156,12 +156,44 @@ const TYPOGRAPHIC_ENTITIES = new Set([
 /**
  * 解码 HTML 实体。
  *
- * suspiciousCount 单独统计「疑似藏字」的实体：数值实体（`&#x69;`）与不在
- * TYPOGRAPHIC_ENTITIES 里的命名实体。`&nbsp;` 这类排版实体照常解码但不计数——
- * 它们在真实页面里遍布，算告警等于对每个网页都误报一次。
+ * suspiciousCount 单独统计「疑似藏字」的实体。分两类判：
+ *
+ *  - 命名实体：按 TYPOGRAPHIC_ENTITIES 白名单排除。`&nbsp;` 这类排版实体照常
+ *    解码但不计数——它们在真实页面里遍布，算告警等于对每个网页都误报一次。
+ *
+ *  - 数值实体：**不再一律算可疑**。实网抓取（blog.rust-lang.org）发现真实页面
+ *    会把普通标点数值化转义：`&#x60;`(反引号) `&#x27;`(单引号) `&#x3D;`(等号)。
+ *    这些是构建工具/模板引擎的常规输出，与「用数字藏字母」毫无关系，一律计数
+ *    会在正常博客上稳定误报。
+ *
+ *    真正的藏字形态是：数字实体**连成词**。`&#x69;gnore`（只藏首字母）、
+ *    整句 `&#105;&#103;...` 都属于此列。判据因此改为「解码后与相邻字符拼出
+ *    字母词」——单独一个 `&#x3D;` 前后都是运算符，不构成词，不计数；
+ *    `&#x69;gnore` 解码出 `ignore` 这个词，计数。
  */
+
+/**
+ * 数值实体解码出的字符，是否可能参与拼词。
+ *
+ * 只有字母有参与拼词的能力；数字与标点即使连成串也不构成「藏起来的词」，
+ * 不应计入可疑。实网上 `&#x3D;`/`&#x27;` 等都是标点与符号，逐个计数
+ * 正是那 34 处误报的来源。
+ */
+function canJoinWord(ch: string): boolean {
+  return /[A-Za-z]/.test(ch);
+}
+
+/** 一串相邻的数值实体解码出的字符。 */
 function decodeEntities(input: string): { text: string; suspiciousCount: number } {
   let suspiciousCount = 0;
+  let run: string[] = [];
+
+  /** 结算当前数值实体片段：整串含字母才计数（标点串是常规转义，不算藏字）。 */
+  const flushRun = (): void => {
+    if (run.length > 0 && run.some(canJoinWord)) suspiciousCount += run.length;
+    run = [];
+  };
+
   const text = input.replace(ENTITY_RE, (match, body: string) => {
     const lower = body.toLowerCase();
     const isNumeric = lower.startsWith("#");
@@ -176,16 +208,48 @@ function decodeEntities(input: string): { text: string; suspiciousCount: number 
       decoded = NAMED_ENTITIES[lower] ?? null;
     }
     if (decoded === null) return match; // 未知实体原样保留，避免误伤正文
-    // 数值实体一律可疑（排版不需要 &#105;）；命名实体按白名单判定
-    if (isNumeric || !TYPOGRAPHIC_ENTITIES.has(lower)) suspiciousCount += 1;
+
+    if (!isNumeric) {
+      // 命名实体：片段到此为止，白名单外的才算可疑
+      flushRun();
+      if (!TYPOGRAPHIC_ENTITIES.has(lower)) suspiciousCount += 1;
+      return decoded;
+    }
+    // 数值实体：先归入当前片段，片段结束后统一判断是否拼出字母词
+    run.push(decoded);
     return decoded;
   });
+  flushRun();
+
   return { text, suspiciousCount };
 }
 
 /** 全角 ASCII 与全角空格转半角。 */
 function toHalfWidth(input: string): string {
   return input.replace(FULLWIDTH_RE, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0));
+}
+
+/**
+ * Unicode 兼容折叠：NFKC。
+ *
+ * 为什么需要：规则表全是 ASCII 词形，且以 `gi` 编译（无 /u，只做 ASCII 大小写折叠）。
+ * 攻击者把 i 换成 𝐢（斜体）、把 g 换成 ⓖ（带圈），字节对规则完全不可见，整句
+ * 「ignore all previous instructions」便原样穿过全部检测，零信号。
+ *
+ * 早先注释里断言「NFKC 不能修数学字母、必须手工映射」是错的：NFKC 一道就覆盖
+ * 带圈拉丁字母与数学字母，且保留大小写（正合规则表的 gi 编译）。
+ */
+function foldUnicodeCompatibility(input: string): string {
+  // 只要 NFKC。早先这里叠了一层「数学字母按码位区段手工映射」，多余且有害：
+  // NFKC 早已正确处理，而手工区段表（斜体段 0x1D434–0x1D44B 等）把偏移算错，
+  // 反而把已经折对的 ASCII 又映成别的字母——实测 𝐢(U+1D456) 被算成了 n，
+  // 于是原本能检出的载荷反而变成漏检。
+  //
+  // 实测 NFKC 一道就覆盖全部形态，且**保留大小写**（正合规则表的 gi 编译）：
+  //   String.fromCodePoint(0x1D456).normalize("NFKC") === "i"   // 斜体小写 i
+  //   String.fromCodePoint(0x1D43C).normalize("NFKC") === "I"   // 斜体大写 I
+  //   "ⓘⓖⓝⓞⓡⓔ".normalize("NFKC")                      === "ignore"
+  return input.normalize("NFKC");
 }
 
 /**
@@ -206,6 +270,16 @@ export function normalize(raw: string, opts: { homoglyphs?: boolean } = {}): Nor
   let text = raw.replace(INVISIBLE_RE, "");
   const decoded = decodeEntities(text);
   text = decoded.text;
+
+  // Unicode 兼容分解。这一步是为了让「同形不同码位」的写法回到同一个规范形式：
+  //   - 带圈拉丁字母 ⓘⓖⓝⓞⓡⓔ → ignore（NFKC 直接修）
+  //   - 数学字母（斜体/粗体/等宽等 U+1D400 起）→ ASCII（同样是 NFKC 的兼容分解）
+  //   - 上下标、上划线、全角变体等兼容字符同理
+  //
+  // 放在不可见字符剔除之后：零宽/双向字符会破坏分解的边界判定，先剥掉更稳。
+  // 放在 toHalfWidth 之前：全角已由 NFKC 覆盖，保留该步骤只是维持既有行为不变。
+  text = foldUnicodeCompatibility(text);
+
   text = toHalfWidth(text);
 
   if (opts.homoglyphs === true) {

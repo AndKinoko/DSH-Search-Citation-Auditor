@@ -38,12 +38,23 @@ export const inject = ["slots", "sessions", "uiConversation"];
 
 export function apply(ctx: Context): void {
   // 悬浮窗：uiConversation 是硬依赖（对话节点所在层），随 inject 就绪。
-  // 挂载失败可接受：设置卡片与报表不受影响。
-  try {
-    mountFloatWindow(ctx);
-  } catch {
-    // 挂载失败可接受：设置卡片与报表不受影响
-  }
+  //
+  // 必须经 ctx.effect 托管：mountFloatWindow 返回的卸载函数此前被直接丢弃，
+  // 于是插件卸载后悬浮球永远留在页面上；更糟的是 HMR 路径只 remove 容器、不
+  // unmount React root——旧 fiber 仍然活着，仍在订阅会话、仍在每次回复后
+  // POST /audit。客户端每次热重载就多积一份。挂载失败可接受：设置卡片与报表不受影响。
+  ctx.effect(() => {
+    try {
+      return mountFloatWindow(ctx);
+    } catch (err) {
+      // 挂载失败可接受：设置卡片与报表不受影响。但要能诊断——静默吞掉会让
+      // 「悬浮窗不出现」既没有报错也没有日志。
+      (ctx as unknown as { logger?: { warn(m: string): void } }).logger?.warn?.(
+        `citation-auditor: 悬浮窗挂载失败 — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return () => {};
+    }
+  }, "citation-auditor float window");
   // settings.section 是 list slot：一个注册项 = 设置页导航里的一个独立页面
   ctx.slots.inject("settings.section", () => {
     try {

@@ -84,18 +84,38 @@ export function blockedToolDecision(auditor: Auditor, name: string | undefined, 
  * 循环安全：用 WeakSet 记录已访问对象，因此不再需要「序列化失败就整体放行」这条
  * fail-open 路径。
  */
+/**
+ * 参数树遍历的最大深度。
+ *
+ * 原实现 `depth > 12` 直接**丢弃**整个子树，于是「嵌套 13 层」即可让被拦域名
+ * 完全不被收集——实测 13/20/50 层全部逃逸。而 args 是模型可控的 JSON，这种
+ * 结构只需模型构造一次就能把拦截彻底关掉。纵深防御的护栏不该是攻击者可预测的常量，
+ * 更不该是「丢弃」这种 fail-open 语义。
+ *
+ * 现在改为：深度超限只**停止下探**，但仍对已见字符串做全局兜底扫描
+ * （见 collectStrings 的溢出分支），保证任何层级的域名都会进入候选。
+ */
+const MAX_WALK_DEPTH = 12;
+
 function collectDomains(args: unknown): Set<string> {
   const out = new Set<string>();
   const seen = new WeakSet<object>();
   const pending: string[] = [];
+  /** 超过深度上限、未能下探的字符串：单独收集，最后统一按裸域名兜底扫描。 */
+  const overflow: string[] = [];
 
   const visit = (value: unknown, depth: number): void => {
-    if (depth > 12 || value === null || value === undefined) return;
+    if (value === null || value === undefined) return;
     if (typeof value === "string") {
       pending.push(value);
       return;
     }
     if (typeof value !== "object") return;
+    // 超出深度：不再下探，但把这一层对象的字符串叶子收进兜底桶
+    if (depth > MAX_WALK_DEPTH) {
+      collectStrings(value, overflow, 0);
+      return;
+    }
     if (seen.has(value)) return;
     seen.add(value);
     if (Array.isArray(value)) {
@@ -111,7 +131,7 @@ function collectDomains(args: unknown): Set<string> {
     // 属性 getter 抛异常等极端情况：已收集的候选仍可用，不整体放弃。
   }
 
-  for (const raw of pending) {
+  for (const raw of [...pending, ...overflow]) {
     // 完整 URL：用解析器拿 hostname（已解码 + 已 IDNA 映射）
     let host: string | null = null;
     try {
@@ -131,4 +151,31 @@ function collectDomains(args: unknown): Set<string> {
     }
   }
   return out;
+}
+
+/**
+ * 深度兜底收集：把任意嵌套结构里的字符串叶子全部捞出来。
+ *
+ * 不设深度上限是故意的——这条路径只在「主遍历已因深度放弃」时执行，而它要解决的
+ * 正是「被拦域名藏在任意深处」。参数体本身受 readJsonBody 的 64KB 上限约束
+ * （routes.ts），遍历成本有界。
+ */
+function collectStrings(value: unknown, sink: string[], depth: number): void {
+  if (value === null || value === undefined || depth > 64) return;
+  if (typeof value === "string") {
+    sink.push(value);
+    return;
+  }
+  if (typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, sink, depth + 1);
+    return;
+  }
+  try {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      collectStrings(item, sink, depth + 1);
+    }
+  } catch {
+    // getter 抛异常：跳过该属性
+  }
 }

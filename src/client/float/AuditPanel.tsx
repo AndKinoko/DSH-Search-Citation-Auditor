@@ -10,10 +10,16 @@ import { button, dimButton, link, dim } from "./styles.js";
 interface AuditPanelProps {
   analyzing: boolean;
   failed: boolean;
+  toobig: boolean;
   auditEnabled: boolean | undefined;
   verdicts: AuditVerdict[];
   ignored: ReadonlySet<string>;
   busy: boolean;
+  /** 名单写入失败时的可诊断信息。旧代码把失败吞掉并照常刷新，用户看不出区别。 */
+  writeFailed: string | null;
+  onDismissWriteFailed: () => void;
+  /** 审计失败后的手动重试入口（自动扫描失败永不推进水位，也就不再自动触发）。 */
+  onRetryAudit: () => void;
   onAddBlocklist: (v: AuditVerdict) => void;
   onConfirmRemove: (what: string, domain: string, op: "unblock" | "unwhitelist") => void;
   onAddWhitelist: (domain: string) => void;
@@ -24,10 +30,14 @@ interface AuditPanelProps {
 export function AuditPanel({
   analyzing,
   failed,
+  toobig,
   auditEnabled,
   verdicts,
   ignored,
   busy,
+  writeFailed,
+  onDismissWriteFailed,
+  onRetryAudit,
   onAddBlocklist,
   onConfirmRemove,
   onAddWhitelist,
@@ -40,7 +50,20 @@ export function AuditPanel({
     <div style={{ overflowY: "auto", padding: "8px 10px", lineHeight: 1.6 }}>
       {analyzing ? <div style={{ color: "gray" }}>⏳ 分析最近回复中…</div> : null}
       {!analyzing && failed ? (
-        <div style={{ color: "#e05555" }}>数据端点不可达（host 端点未就绪或已停用）。</div>
+        <div style={{ color: "#e05555" }}>
+          {toobig ? "正文太长（超过 64KB），请缩短内容或分段审计。" : "数据端点不可达（host 端点未就绪或已停用）。"}{" "}
+          <button type="button" style={link} onClick={onRetryAudit}>
+            重试
+          </button>
+        </div>
+      ) : null}
+      {writeFailed !== null ? (
+        <div style={{ color: "#e05555" }}>
+          {writeFailed}{" "}
+          <button type="button" style={link} onClick={onDismissWriteFailed}>
+            知道了
+          </button>
+        </div>
       ) : null}
       {!analyzing && !failed && auditEnabled !== undefined && !auditEnabled ? (
         <div style={{ color: "gray" }}>插件已休眠（⚙ 设置里可重新开启）。</div>

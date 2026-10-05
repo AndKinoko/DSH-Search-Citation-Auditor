@@ -259,8 +259,29 @@ export const TOOL_ABUSE_RULES = [
     id: "tool-agent-loop",
     label: "诱导自主执行（免确认代理）",
     severity: "high",
-    // "autonomously executes tasks without confirmation" / "act as an agent that ..."
-    pattern: String.raw`(?:autonomous(?:ly)?|without\s+(?:any\s+)?(?:confirmation|approval|asking|permission|prompting|user\s+input)|no\s+need\s+to\s+(?:ask|confirm)|do\s+not\s+ask\s+(?:for\s+)?(?:permission|confirmation))\b[^.!?\n]{0,120}?(?:execute|perform|run|act|proceed|complete|task|goal|objective|instruction|request)s?\b`,
+    // 真实威胁模型：页面诱导模型「别问用户，自己动手」。它的两个要素是
+    // **绑定关系**——「免确认」与「执行动作」必须同属一个动作短语。
+    //
+    // 原写法把两者隔开：trigger[^.!?\n]{0,120}?(execute|task|…)s?
+    // 中间那 120 字符窗口不看语义，于是两句并列的纯技术叙述也会中招。实测
+    // en.wikipedia.org/wiki/Artificial_intelligence（真实抓取）报出 high：
+    //   "autonomously plays nine previously unseen video games and learns new tasks"
+    // 「自主地打 Atari」和「学会新任务」只是并列陈述，句中没有任何「因此不必
+    // 询问用户」的因果——却被判成诱导免确认代理。high 级误报会盖掉真告警，
+    // 比漏报更危险，必须收紧。
+    //
+    // 现在要求 trigger 与动作/宾语**贴邻**（中间只容空白与连接词），
+    // 并同时补上原写法漏掉的方向：「执行任务且免确认」在前、「自主执行」在后
+    // （"Some systems execute tasks autonomously without user input" 曾整句漏网）。
+    //
+    // 动作词表务必收全 complete/fulfill/handle：漏一个词族就等于给该句式开门。
+    // "acts autonomously and completes each task without asking" 是典型攻击形态，
+    // 曾因 completes 不在表内而漏报（收紧误报时一度把它一并丢掉了）。
+    //
+    // 宾语前缀同样要收全：each/every 是最常见的量化限定（"completes each task"），
+    // "proceed with the instructions" 的 with 也得容下。这两处漏掉都会让真实攻击
+    // 句式整句逃逸，而它们的代价为零——多列一个限定词不会引回并列技术叙述。
+    pattern: String.raw`(?:(?:autonomous(?:ly)?|without\s+(?:any\s+)?(?:confirmation|approval|asking|permission|prompting|user\s+input)|no\s+need\s+to\s+(?:ask|confirm)|do\s+not\s+ask\s+(?:for\s+)?(?:permission|confirmation))\s+(?:\w+\s+){0,3}?(?:execute|perform|run|act|proceed|complete|fulfill|handle|carry\s+out|carry\s+on)\w*\s+(?:with\s+|on\s+)?(?:the\s+|this\s+|these\s+|your\s+|all\s+|any\s+|each\s+|every\s+|both\s+)?(?:tasks?|goals?|objectives?|instructions?|requests?|steps?|actions?|commands?)\b|(?:execute|perform|carry\s+out|run|complete|fulfill|handle)\w*\s+(?:with\s+|on\s+)?(?:the\s+|this\s+|these\s+|your\s+|all\s+|any\s+|each\s+|every\s+|both\s+)?(?:tasks?|goals?|objectives?|instructions?|requests?|steps?|actions?|commands?)\s+(?:on\s+your\s+own\s+)?(?:autonomous(?:ly)?|without\s+(?:any\s+)?(?:confirmation|approval|asking|permission|prompting|user\s+input)|with\s+no\s+(?:confirmation|approval|human\s+oversight)))\b`,
   },
   {
     id: "tool-silent",

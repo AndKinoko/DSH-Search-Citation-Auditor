@@ -111,6 +111,15 @@ export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
   const [modal, setModal] = useState<ModalSpec | undefined>(undefined);
   const [rawOpen, setRawOpen] = useState(false);
   const [suppressedModes, setSuppressedModes] = useState<ReadonlySet<string>>(new Set());
+  /**
+   * 名单写入失败的可见原因。
+   *
+   * 修订记录（同 FloatWindow 的 M9-c）：原实现 `.then(() => refresh()).catch(() => {})`
+   * 吞掉一切失败。fetch 对 4xx 照常 resolve，于是 guardRoute 的 403 与 `{ok:false}`
+   * 的 200 全走成功分支——用户点「加入拦截名单」实际什么都没写入，报表却静默刷新，
+   * 按钮状态还按乐观预期变灰，看着像成功了。失败必须说出口。
+   */
+  const [writeFailed, setWriteFailed] = useState<string | null>(null);
 
   const text = textFromProps(props);
 
@@ -137,17 +146,31 @@ export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
     if (settled && !isError) refresh();
   }, [settled, isError, refresh]);
 
-  /** 名单写入 + 刷新。host 端点不可用时保持原状（failed 已有提示）。 */
+  /** 名单写入 + 刷新。失败时给出可诊断原因，不静默当作成功。 */
   const mutate = useCallback(
     (op: "block" | "unblock" | "whitelist" | "unwhitelist", domain: string): void => {
       setBusy(true);
+      setWriteFailed(null);
       fetch("/api/citation-auditor/list", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ op, domain }),
       })
-        .then(() => refresh())
-        .catch(() => {})
+        .then((r) =>
+          r.ok
+            ? (r.json() as Promise<{ ok: boolean; error?: string }>)
+            : Promise.reject(new Error(`HTTP ${r.status}`)),
+        )
+        .then((d) => {
+          // 200 也可能是 {ok:false}：guardRoute 之外的业务失败走这条路
+          if (d.ok !== true) throw new Error(d.error ?? "unknown");
+          refresh();
+        })
+        .catch((err: unknown) => {
+          setWriteFailed(
+            `名单写入失败（${err instanceof Error ? err.message : String(err)}），本次没有落盘——请重试。`,
+          );
+        })
         .finally(() => setBusy(false));
     },
     [refresh],
@@ -168,14 +191,36 @@ export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
             label: "开启并保存",
             onClick: () => {
               const field = BLOCKLIST_FIELD[audit?.mode ?? "normal"];
-              // 经插件自有 /settings 端点直接置位（settings 服务命名空间在当前宿主不可靠）
+              // 必须**先等开关写成功**再写名单：原实现不 await 就紧接 mutate，
+              // 于是开关写失败时域名已经进了名单但该模式的 blocklistEnabled 仍是
+              // false——名单存着却不生效，状态自相矛盾且用户毫无察觉。
+              // 两步任一失败都如实报出来，绝不吞掉。
+              setBusy(true);
               fetch("/api/citation-auditor/settings", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ [field]: true }),
-              }).catch(() => {});
-              mutate("block", v.domain);
-              setModal(undefined);
+              })
+                .then((r) =>
+                  r.ok
+                    ? (r.json() as Promise<{ ok: boolean; error?: string }>)
+                    : Promise.reject(new Error(`HTTP ${r.status}`)),
+                )
+                .then((d) => {
+                  if (d.ok !== true) throw new Error(d.error ?? "unknown");
+                  // 开关已就位，再落名单
+                  mutate("block", v.domain);
+                })
+                .catch((err: unknown) => {
+                  setWriteFailed(
+                    `开启拦截名单失败（${err instanceof Error ? err.message : String(err)}），` +
+                      `${v.domain} 未写入——请重试或到设置页确认 host 端点状态。`,
+                  );
+                })
+                .finally(() => {
+                  setBusy(false);
+                  setModal(undefined);
+                });
             },
           },
           {
@@ -274,6 +319,9 @@ export function CitationAuditRow(props: AuditRowProps): React.ReactElement {
 
   return (
     <div style={box} data-tool="citation_audit" data-mode={audit.mode}>
+      {writeFailed !== null ? (
+        <div style={{ color: "#e05555" }}>{writeFailed}</div>
+      ) : null}
       <div>{"════════════════════════════════════════════"}</div>
       <div>{`📊 引用来源威胁度分析（${shown.length}个域名，按威胁度降序）`}</div>
       <div>{"════════════════════════════════════════════"}</div>

@@ -13,6 +13,7 @@ interface FloatBallProps {
   nonTrusted: number;
   failed: boolean;
   hasVerdicts: boolean;
+  onActivate: () => void;
   dragHandlers: {
     onPointerDown: (e: React.PointerEvent) => void;
     onPointerMove: (e: React.PointerEvent) => void;
@@ -21,7 +22,11 @@ interface FloatBallProps {
   };
 }
 
-export function FloatBall({ pos, nonTrusted, failed, hasVerdicts, dragHandlers }: FloatBallProps): React.ReactElement {
+export function FloatBall({ pos, nonTrusted, failed, hasVerdicts, onActivate, dragHandlers }: FloatBallProps): React.ReactElement {
+  const activate = (): void => {
+    // 键盘激活（Enter/空格）不是拖拽：直接视为点击，不触碰拖拽状态。
+    onActivate();
+  };
   const dotColor = failed
     ? "#e05555"
     : nonTrusted > 0
@@ -29,10 +34,36 @@ export function FloatBall({ pos, nonTrusted, failed, hasVerdicts, dragHandlers }
       : hasVerdicts
         ? LEVEL_COLOR.trusted
         : "#888";
+  const accessLabel =
+    failed || nonTrusted > 0
+      ? `引用来源威胁：${nonTrusted} 个非可信域名，按回车展开审查报告`
+      : hasVerdicts
+        ? "引用来源威胁：当前回复全部可信，按回车展开审查报告"
+        : "引用来源威胁：按回车展开审查报告";
 
   return (
     <div
       data-citation-auditor-ball
+      // 键盘与读屏用户的唯一入口：无它，整个悬浮窗功能对这部分用户不存在。
+      // 保留 div 而不用 button，是避免把已经写死的圆形外观与拖拽热区一起拆开。
+      role="button"
+      tabIndex={0}
+      aria-label={accessLabel}
+      aria-expanded={false}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        // 空格默认会滚动页面；这里是操作，不是翻页。
+        e.preventDefault();
+        e.stopPropagation();
+        activate();
+      }}
+      onFocus={(e) => {
+        e.currentTarget.style.outline = "2px solid #4aa3ff";
+        e.currentTarget.style.outlineOffset = "2px";
+      }}
+      onBlur={(e) => {
+        e.currentTarget.style.outline = "none";
+      }}
       onPointerDown={dragHandlers.onPointerDown}
       onPointerMove={dragHandlers.onPointerMove}
       onPointerUp={dragHandlers.onPointerUp}
@@ -59,9 +90,10 @@ export function FloatBall({ pos, nonTrusted, failed, hasVerdicts, dragHandlers }
       }}
       title="引用来源威胁度（拖动移动，点击展开）"
     >
-      🛡
+      <span aria-hidden="true">🛡</span>
       {nonTrusted > 0 ? (
         <span
+          aria-hidden="true"
           style={{
             position: "absolute",
             top: -6,
